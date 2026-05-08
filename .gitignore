@@ -1,0 +1,35 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# node
+node_modules/
+dist/
+build/
+
+# logs/temp
+*.log
+*.tmp
+.DS_Store
+
+# uploads / generated data
+uploads/
+logs/
+
+# databases / dumps
+*.db
+*.sqlite
+*.dump
+*.bak
+
+# IDE
+.vscode/
+.idea/

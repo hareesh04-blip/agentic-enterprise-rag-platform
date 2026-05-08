@@ -1,0 +1,86 @@
+{
+  "timestamp_utc": "2026-05-07T07:55:46.181457+00:00",
+  "base_url": "http://127.0.0.1:8010",
+  "expected_provider": "ollama",
+  "observed_provider": {
+    "llm_provider": "ollama",
+    "embedding_provider": "ollama"
+  },
+  "health": {
+    "status_code": 200,
+    "body": {
+      "status": "healthy",
+      "app_name": "Agentic Enterprise API RAG Backend",
+      "environment": "local"
+    }
+  },
+  "login": {
+    "status_code": 200,
+    "user": {
+      "id": 1,
+      "email": "superadmin@local",
+      "full_name": "Default Super Admin"
+    },
+    "token_obtained": true
+  },
+  "query_set": [
+    {
+      "id": "api_lookup_01",
+      "type": "api_lookup",
+      "knowledge_base_id": 1,
+      "question": "API-REST-NOK-01 endpoint details"
+    }
+  ],
+  "summary": {
+    "query_total": 1,
+    "query_passed": 1,
+    "retrieval_mode_counts": {
+      "db_keyword_fallback": 1
+    },
+    "llm_status_counts": {
+      "generation_retry_failed": 1
+    },
+    "fallback_count": 1,
+    "hybrid_fusion_count": 0,
+    "overall_pass": false
+  },
+  "checks": {
+    "backend_health_ok": true,
+    "login_ok": true,
+    "api_kb_query_ok": true,
+    "product_kb_query_ok": false,
+    "diagnostics_populated": true,
+    "sources_returned": true,
+    "insufficient_context_safety_ok": true,
+    "provider_expectation_ok": true
+  },
+  "results": [
+    {
+      "id": "api_lookup_01",
+      "type": "api_lookup",
+      "knowledge_base_id": 1,
+      "question": "API-REST-NOK-01 endpoint details",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 380,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    }
+  ]
+}

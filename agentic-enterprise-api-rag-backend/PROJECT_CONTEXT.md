@@ -1,0 +1,850 @@
+# Project name
+Agentic Enterprise API RAG Backend
+
+## Current architecture
+- FastAPI backend on Windows
+- PostgreSQL for metadata/RBAC/chat history
+- Qdrant for vector DB
+- Config-driven LLM/embedding provider abstraction
+- Provider switching is config-only (OpenAI + Ollama)
+- Provider-aware Qdrant collections implemented
+- Provider-aware vector dimensions implemented
+- Redis planned
+- Neo4j disabled for Phase 1
+- Mac Ollama via Caddy:
+  http://172.16.111.209:8080
+- OpenAI support added for POC/demo stability
+- Backend runs on:
+  http://127.0.0.1:8010
+- Run backend WITHOUT --reload
+- Frontend stack:
+  - React
+  - TypeScript
+  - Vite
+  - Tailwind CSS
+  - React Router
+  - Axios
+- Frontend characteristics:
+  - role-aware routing
+  - KB-aware UI visibility
+  - RBAC-aligned navigation
+  - provider-aware UX
+  - diagnostics-aware UI
+  - workspace-driven architecture
+
+## Current completed status
+- Step 15: Chat session persistence
+- Step 16: JWT Auth + RBAC + User Management
+- Step 16.9: Swagger/OpenAPI Bearer Auth polish
+- Step 17.1: Knowledge Base CRUD
+- Step 17.2: Documents linked to Knowledge Bases
+- Step 17.3: Knowledge Base aware query/retrieval
+- Step 17.4: Knowledge Base aware chat sessions
+- Step 17.5: Knowledge Base Access Management Polish
+- Step 18.1: Product Document Classification + Metadata Enrichment
+- Step 18.2: Product-oriented Chunking Strategy
+- Step 18.3: Product-aware Prompting
+- Step 18.4: Product Document Metadata Enrichment Polish
+- Step 18.5: Product Documentation Retrieval Validation
+- Step 19.1: Ollama Connectivity Stabilization
+- Step 19.2: Embedding persistence and vector retrieval validation
+- Step 20.1: Provider abstraction (OpenAI + Ollama)
+- Step 20.2: Retrieval quality and response quality improvements (**mostly completed: Phase A + Phase B + Phase C implemented**)
+- Step 20.3: Evaluation hardening and demo-readiness validation
+- Step 22.1: Frontend foundation setup
+- Step 22.2: Backend-supported accessible KB endpoint + frontend KB visibility cleanup
+- Step 22.3: Full KB-aware chat UI
+- Step 22.4: Chat session UX
+- Step 22.5: Document Upload and Document Explorer UI
+- Step 22.6: Demo polish and role-based workspace refinement
+- Step 23: Final Demo Packaging and Signoff
+- Step 24: Hybrid retrieval + metadata-aware reranking
+- Step 25: Suggested Follow-up Questions
+- Step 26: Confidence Scoring
+- Step 27: Enhanced Sources Panel UX
+
+## Current important behavior
+- JWT auth works
+- Swagger BearerAuth works
+- RBAC permission guards work
+- User management APIs exist
+- Knowledge Base CRUD exists
+- KB user access management APIs exist
+- KB users can be granted/updated/removed/listed via APIs
+- KB access levels supported: read, write, admin
+- KB access management APIs are protected by knowledge_bases.manage
+- Documents are linked to knowledge_base_id
+- api_documents now supports document_type, source_domain, product_name
+- document_type supports: api, product, hr
+- Upload accepts document_type, source_domain, product_name, version
+- Upload validates KB access
+- Query requires knowledge_base_id
+- Retrieval is filtered by knowledge_base_id
+- Retrieval source metadata includes document_type and product_name
+- API document chunking remains unchanged
+- Product documents now use product_section_chunk
+- Product chunking uses logical sections from DOCX
+- Product chunks preserve section title/context
+- HR documents currently use generic_section_chunk
+- Parser now returns logical_sections
+- Product chunk metadata includes document_type, section_title, product_name
+- rag_service/retrieval_service support section_title metadata
+- Added document-type-aware prompt mode selection
+- API prompts remain API-oriented and stable
+- Product prompts are workflow/user-guide oriented
+- HR currently uses generic prompt mode
+- Product context formatting includes product_name and section_title when available
+- Prompt selection was verified with API and Product metadata
+- Added GET /api/v1/ingestion/documents
+- Added optional document filters:
+  - document_type
+  - product_name
+  - knowledge_base_id
+- POST /api/v1/query/ask now supports optional debug=false/true
+- When debug=true, response includes diagnostics:
+  - retrieval_mode
+  - retrieved_chunk_count
+  - dominant_document_type
+  - dominant_product_name
+  - section_coverage_count
+  - kb_match_verified
+- debug=false or omitted preserves normal response shape
+- Added lightweight structured retrieval logs
+- Document detail/endpoints response now includes:
+  - document_type
+  - product_name
+  - source_domain
+  - document_version
+  - knowledge_base_id
+  - knowledge_base_name
+  - created_at
+- Chat sessions store knowledge_base_id
+- Cross-KB session continuation is blocked
+- Cross-KB user access is denied
+- Retrieval currently uses db_keyword_fallback because vectors are not fully populated
+- db_keyword_fallback remains active
+- Query sources now include:
+  - source_domain
+  - document_version
+  - document_type
+  - product_name
+  - section_title where available
+- section_title may not always appear in query sources while fallback dominates
+- Product DOCX upload was verified successfully
+- API DOCX upload was verified successfully
+- Product KB query returns source metadata correctly
+- API KB query still works
+- Runtime API/Product queries return 200
+- Product/API queries still work
+- Product KB debug query verified
+- dominant_document_type reports product correctly
+- dominant_product_name reports Claims Portal correctly
+- kb_match_verified=true confirms KB isolation
+- Retrieval remains db_keyword_fallback
+- Swagger shows the new document filters
+- Swagger/OpenAPI shows debug field
+- Step 19.1 (Ollama connectivity stabilization): see **Step 19** below for retries, timeouts, diagnostics, fallback behavior, and known intermittency
+- Step 19.2 completed: vector persistence and vector retrieval validation are implemented (see **Step 19** below)
+- Product KB vector retrieval path is validated
+- API KB vector retrieval may still return vector_kb_filtered_empty depending on source coverage
+- Mac Ollama intermittency is treated as operational/network behavior, not backend architecture failure
+- `LLM_PROVIDER` supports: `ollama`, `openai`
+- `EMBEDDING_PROVIDER` supports: `ollama`, `openai`
+- OpenAI generation path implemented
+- OpenAI embedding path implemented
+- Ollama generation path preserved
+- Ollama embedding path preserved
+- Provider-aware Qdrant collection routing implemented
+- Provider-aware vector dimension resolver implemented
+- Current collections:
+  - `enterprise_api_docs` (Ollama / 768)
+  - `enterprise_api_docs_openai` (OpenAI / 1536)
+- OpenAI vector ingestion validated
+- OpenAI vector retrieval validated
+- OpenAI `vector_success` validated
+- Product KB OpenAI retrieval validated
+- Diagnostics include:
+  - `llm_provider`
+  - `embedding_provider`
+  - `llm_model`
+  - `embedding_model`
+  - `vector_collection_name`
+  - `configured_collection_embedding_dim`
+  - `embedding_dimension_matches_collection`
+- Safe fallback behavior preserved
+- Ollama fallback behavior preserved during Mac connectivity intermittency
+- Backend health verified on 127.0.0.1:8010
+- LLM style differences may not show consistently while Ollama generation is intermittent
+- Neo4j remains disabled for Phase 1
+- No migration added for Step 17.5
+- Existing query/chat/upload behavior unchanged
+- Ingestion blocker fix applied: api_parameters.mandatory_optional expanded to TEXT
+- Ingestion blocker fix applied: api_parameters.param_type expanded to TEXT
+- Step 20.2 Phase A implemented:
+  - candidate pool expansion
+  - local reranking
+  - metadata-aware ranking boosts
+- Step 20.2 Phase B implemented:
+  - hybrid rescue for weak vector retrieval
+  - low-confidence vector recovery path
+- Step 20.2 Phase C implemented:
+  - prompt-context selection from ranked retrieval outputs
+  - context deduplication
+  - diversity balancing
+  - prompt context budget control
+- Step 20.2 diagnostics added:
+  - `candidate_pool_size`
+  - `reranked_result_count`
+  - `hybrid_fusion_used`
+  - `metadata_boost_applied`
+  - `top_combined_score`
+  - `rerank_strategy`
+  - `vector_confidence_bucket`
+  - `fusion_candidate_count`
+  - `selected_prompt_chunk_count`
+  - `dedup_chunks_removed`
+  - `diversity_caps_applied`
+  - `final_prompt_context_chars`
+- API contracts unchanged
+- Provider abstraction unchanged
+- RBAC/KB/session isolation unchanged
+- Fallback safety preserved
+- Remaining weak cases appear mostly related to corpus coverage/content quality, not architecture
+- Demo validation harness added
+- Stable 12-query demo set created
+- OpenAI provider demo path validated successfully
+- Ollama degraded/local path validated for safe fallback
+- Deterministic insufficient-context fallback implemented
+- Insufficient-context message:
+  - "I could not find enough information in the selected knowledge base to answer this confidently."
+- `llm_status` now supports/uses `fallback_insufficient_context`
+- Demo checklist added
+- API contracts unchanged
+- Provider abstraction unchanged
+- RBAC/KB/session isolation unchanged
+- Fallback safety preserved
+- Mac-hosted Ollama connectivity remains intermittent operationally, but backend handles it safely without hangs/crashes
+- Frontend users only see KBs returned by:
+  - `GET /api/v1/knowledge-bases/me`
+- Frontend never shows unrelated KBs
+- Frontend action visibility depends on:
+  - role
+  - access_level
+  - can_query
+  - can_upload
+  - can_manage
+  - can_view_documents
+- Backend remains source of truth for access control
+- Frontend reflects backend access only
+- `DocumentsPage` implemented
+- KB-scoped document listing added
+- Access-aware document upload added
+- Upload form visible only when `selectedKb.can_upload=true`
+- Document list visible only when `selectedKb.can_view_documents=true`
+- Frontend document filters added:
+  - `document_type`
+  - `product_name`
+  - `knowledge_base_id`
+- Upload metadata supported:
+  - `knowledge_base_id`
+  - `document_type`
+  - `source_domain`
+  - `product_name`
+  - `version`
+- Upload result displays ingestion/vector fields when returned
+- Document list refreshes after successful upload
+- Frontend never allows arbitrary KB ID entry for upload
+- Frontend always scopes document listing to selected KB
+- Backend hardening: `GET /api/v1/ingestion/documents` now enforces KB access
+- Platform admin/superadmin can list documents across KBs
+- Regular users can list only explicitly accessible KB documents
+- Unauthorized `knowledge_base_id` returns `403`
+- Omitting `knowledge_base_id` returns only accessible KB documents
+- No-access users see empty list or are blocked from specific KBs
+- Critical cross-KB document visibility gap closed
+- Step 22.6 completed: frontend demo polish and role-based workspace refinement implemented
+- Role-aware workspace refinement implemented
+- Sidebar grouped into Workspace and Administration sections
+- Top navigation now shows selected KB, provider badge, role badge, and user info
+- KB selector now shows domain/access/capability hints
+- Chat UX polished with answer cards, copy button, loading state, auto-scroll, and clearer insufficient-context banner
+- Diagnostics panel polished and remains restricted to admin/QA visibility
+- DocumentsPage polished with metadata/status badges and clearer upload permission messaging
+- Dashboard demo cards added
+- Future-phase placeholders added for:
+  - Recruitment Workspace
+  - Analytics
+  - Advanced Diagnostics
+- Frontend README updated with startup, demo, provider, and troubleshooting instructions
+- Validation summary for Step 22.6:
+  - Admin walkthrough passed
+  - Limited/read-only walkthrough passed
+  - Writer/admin KB user walkthrough passed
+  - Product/API/insufficient-context chat validation passed
+  - Document listing/upload permission validation passed
+  - `npm run build` passed
+  - QA/tester walkthrough pending (seeded QA/tester users unavailable)
+  - HR/basic walkthrough pending (seeded HR/basic users unavailable)
+  - Manual screenshots pending for final demo packaging
+- Bug fixes discovered and applied during Step 22.6 validation:
+  - `GET /api/v1/ingestion/documents` listing permission adjusted so read/query users can view documents when KB access allows
+  - Frontend `canViewDocuments` updated to align with backend `can_view_documents` behavior
+  - KB access hierarchy fixed:
+    - `read` is satisfied by `read`/`write`/`admin`
+    - `write` is satisfied by `write`/`admin`
+    - `admin` is satisfied by `admin`
+- Step 23 completed: demo packaging and operational signoff artifacts prepared
+- Seeded demo users:
+  - `qa@local` (role: `qa`, KB: Product Documentation, diagnostics visible)
+  - `hr@local` (role: `hr_basic`, KB: HR Resume Screening, diagnostics/admin hidden)
+- Demo packaging docs created:
+  - `docs/demo_runbook.md`
+  - `docs/demo_script.md`
+  - `docs/startup_checklist.md`
+  - `docs/troubleshooting_checklist.md`
+  - `docs/known_limitations.md`
+  - `docs/demo_queries.md`
+  - `docs/environment_freeze.md`
+  - `docs/screenshots/*` placeholders
+- Step 23 validation completed:
+  - backend startup verification passed (`/api/v1/health`)
+  - frontend startup verification passed (`http://localhost:5173`)
+  - OpenAI provider demo query passed (`llm_provider=openai`)
+  - insufficient-context query passed (`llm_status=fallback_insufficient_context`)
+  - document upload flow passed
+  - QA walkthrough passed
+  - HR/basic walkthrough passed
+  - `npm run build` passed
+- Recommended demo provider mode for stable presentation:
+  - `LLM_PROVIDER=openai`
+  - `EMBEDDING_PROVIDER=openai`
+- Step 24 completed: Hybrid retrieval + metadata-aware reranking
+- Summary:
+  - Implemented a safe, additive retrieval-quality upgrade for the Agentic Enterprise API RAG Platform.
+  - Existing RAG behavior, endpoints, RBAC, KB isolation, provider abstraction, frontend contract, database schema, and Qdrant provider-aware collection naming were preserved.
+- What was implemented:
+  - Added config-controlled hybrid retrieval kill switches:
+    - `ENABLE_HYBRID_RETRIEVAL`
+    - `ENABLE_METADATA_RERANKING`
+    - `HYBRID_VECTOR_TOP_K`
+    - `HYBRID_KEYWORD_TOP_K`
+    - `FINAL_CONTEXT_TOP_K`
+  - Added deterministic query intent detection for:
+    - authentication questions
+    - error / failed-response questions
+    - async / callback questions
+    - API lookup questions
+    - parameter lookup questions
+    - overview / purpose questions
+  - Added hybrid retrieval using:
+    - existing vector retrieval
+    - keyword candidate retrieval
+    - metadata-aware reranking
+    - chunk-type boosting
+    - intent-specific boosting
+  - Added metadata-aware reranking to improve retrieval for:
+    - authentication chunks
+    - failed response chunks
+    - async service pattern metadata
+    - API metadata chunks
+    - request / response parameter chunks
+    - document overview chunks
+  - Added async aggregation support for questions like:
+    - "Which APIs are asynchronous?"
+  - Added error lookup support for questions like:
+    - "What happens if TimeSlotCategory is invalid?"
+  - Added retrieval diagnostics:
+    - `retrieval_mode`
+    - `detected_intents`
+    - `vector_candidate_count`
+    - `keyword_candidate_count`
+    - `final_context_count`
+    - `top_chunk_types`
+    - `applied_boosts`
+  - Added retrieval logging summary:
+    - question
+    - kb_id
+    - retrieval_mode
+    - detected_intents
+    - candidate count
+    - final context count
+    - top chunk types
+    - top API references / service names when available
+  - Added safe fallback:
+    - if hybrid retrieval or reranking fails, system falls back to existing vector-only retrieval.
+- Files changed:
+  - `app/core/config.py`
+  - `app/services/query_intent_service.py`
+  - `app/services/retrieval_service.py`
+  - `app/services/rag_service.py`
+  - `tests/test_hybrid_intent_rerank.py`
+- Validation completed:
+  - Backend health verified:
+    - `GET http://127.0.0.1:8010/api/v1/health` returned `200`
+  - BB DOCX ingestion remained successful:
+    - `chunk_count: 164`
+    - `api_count: 18`
+    - vector collection: `enterprise_api_docs_openai`
+    - embedding dimension: `1536`
+  - Passed query validation:
+    - "What authentication method is used by the APIs?"
+    - "What happens if TimeSlotCategory is invalid?"
+    - "Which APIs are asynchronous?"
+    - "Which API is used to check order status?"
+    - "Which API is used to revise an order?"
+    - "What is the purpose of the BB Order Service document?"
+    - "What is the purpose of the getAppointment API?"
+- Current retrieval status:
+  - API lookup retrieval: working
+  - API purpose retrieval: working
+  - document overview retrieval: working
+  - authentication retrieval: working
+  - failed-response/error retrieval: working
+  - async aggregation retrieval: working
+  - existing vector-only fallback preserved
+- Operational notes:
+  - OpenAI demo path remains stable.
+  - Ollama support remains preserved for local/final architecture.
+  - `pytest` is not installed in the current environment, but tests were added and can be run after installing pytest:
+    - `pip install pytest`
+    - `pytest tests/test_hybrid_intent_rerank.py -v`
+    - `pytest tests/test_docx_ingestion_quality.py -v`
+
+- Step 25 completed: Suggested Follow-up Questions
+- Summary:
+  - Added deterministic suggested follow-up questions after successful RAG answers.
+  - Suggestions are grounded in retrieved context metadata/chunk types.
+  - Frontend displays suggestions as clickable chips.
+- Backend files changed:
+  - `app/core/config.py`
+  - `app/services/suggested_question_service.py`
+  - `app/api/v1/endpoints/query.py`
+  - `app/services/rag_service.py`
+- Frontend files changed:
+  - `frontend/src/types/query.ts`
+  - `frontend/src/pages/ChatPage.tsx`
+- Config flags added:
+  - `ENABLE_SUGGESTED_QUESTIONS=True`
+  - `SUGGESTED_QUESTION_COUNT=4`
+- Backend response addition:
+  - `suggested_questions: list[str] = []`
+- Diagnostics added when `debug=true`:
+  - `suggested_question_count`
+  - `suggested_question_generation_mode`
+  - `suggested_question_status`
+- Behavior:
+  - Suggestions generated only for successful grounded answers.
+  - Suggestions skipped for insufficient-context fallback.
+  - Suggestions skipped when no retrieved context exists.
+  - Suggestion generation is deterministic and non-blocking.
+  - Suggestion service never breaks the main answer flow.
+- Frontend behavior:
+  - Assistant answers show "Suggested follow-ups" chips.
+  - Clicking a chip submits it as the next user question.
+  - Current KB and `session_id` are preserved.
+  - Chips hidden during loading and fallback answers.
+- Validation results:
+  - Backend compile successful.
+  - Frontend `npm run build` successful.
+  - Login with `qa@local` succeeded.
+  - Query tested: "What authentication method is used by the APIs?"
+  - API-oriented suggestions returned.
+  - Chip click flow validated with same `session_id`.
+  - Fallback query returned `suggested_questions=[]`.
+  - No request failures observed.
+- Known limitation:
+  - Some API suggestions may show "Service: Unknown Service" when retrieved metadata does not include `service_name`.
+  - Current generation is deterministic/rule-based only; LLM-based suggestions are intentionally not enabled yet.
+
+- Step 26 completed: Confidence Scoring
+- Summary:
+  - Added deterministic retrieval-grounded confidence scoring for RAG answers.
+  - Confidence is derived from retrieval quality signals already produced by the system.
+  - Frontend displays confidence as a compact assistant-answer badge.
+- Backend files changed:
+  - `app/core/config.py`
+  - `app/services/confidence_service.py`
+  - `app/api/v1/endpoints/query.py`
+  - `app/services/rag_service.py`
+- Frontend files changed:
+  - `frontend/src/types/query.ts`
+  - `frontend/src/pages/ChatPage.tsx`
+- Config flags:
+  - `ENABLE_CONFIDENCE_SCORING=True`
+  - `CONFIDENCE_HIGH_THRESHOLD=0.75`
+  - `CONFIDENCE_MEDIUM_THRESHOLD=0.45`
+- Backend response addition:
+  - `confidence: dict | None`
+  - shape: `score`, `label`, `reasons`
+- Debug diagnostics:
+  - `confidence_score`
+  - `confidence_label`
+  - `confidence_reasons`
+  - `confidence_status`
+- Behavior:
+  - deterministic retrieval-grounded scoring only
+  - no LLM confidence scoring
+  - fallback answers return `score=0.0` and `label=low`
+  - scoring is non-blocking and safe
+- Frontend behavior:
+  - confidence badge shown on assistant answers
+  - badge displays High/Medium/Low confidence and percentage
+  - tooltip/title exposes reasons
+- Validation:
+  - backend compile passed
+  - frontend `npm run build` passed
+  - QA login passed
+  - successful query returned medium confidence `0.73`
+  - fallback query returned low confidence `0.0`
+  - suggested follow-up chips still work
+- Known limitation:
+  - current confidence is retrieval-quality confidence, not factual truth guarantee
+  - score tuning may be refined after more evaluation queries
+
+- Step 27 completed: Enhanced Sources Panel UX
+- Summary:
+  - Enhanced Sources panel with enterprise-grade grounding/traceability UX.
+  - Frontend-first additive implementation.
+  - No backend endpoint/schema changes.
+- Frontend files changed:
+  - `frontend/src/pages/ChatPage.tsx`
+- Behavior added:
+  - Sources grouped by document/source.
+  - Source cards collapsed by default and expandable.
+  - Chunk-type badges displayed.
+  - API/service metadata badges displayed where available.
+  - Frontend-derived relevance badges displayed.
+  - Deterministic "why this source matched" helper text shown.
+  - Fallback answers suppress misleading source cards even if backend returns sources.
+- Validation:
+  - `npm run build` passed.
+  - Successful query still shows answer, confidence badge, suggested chips, and grouped sources.
+  - Fallback query shows fallback answer and low confidence, but no suggested chips and no misleading sources.
+  - No backend changes required.
+  - No endpoint contracts changed.
+- Known limitations:
+  - Some sources may still lack `service_name` metadata, limiting badge richness.
+  - Source preview is currently derived from available metadata because raw chunk text is not always included in the source payload.
+
+- Step 28 completed: Impact Analysis MVP
+- Summary:
+  - Added deterministic Impact Analysis MVP.
+  - Backend extracts lightweight API/service/product relationships from retrieved metadata.
+  - Frontend displays an Impact Analysis panel for successful grounded answers.
+  - No Neo4j/graph database enabled.
+  - No architecture redesign.
+- Backend files changed:
+  - `app/core/config.py`
+  - `app/services/impact_analysis_service.py`
+  - `app/api/v1/endpoints/query.py`
+  - `app/services/rag_service.py`
+- Frontend files changed:
+  - `frontend/src/types/query.ts`
+  - `frontend/src/pages/ChatPage.tsx`
+- Config flag:
+  - `ENABLE_IMPACT_ANALYSIS=True`
+- Backend response addition:
+  - `impact_analysis: dict | None`
+  - Shape:
+    - `primary_entities`
+    - `related_entities`
+    - `potential_impacts`
+    - `relationship_summary`
+    - `impact_confidence`
+- Debug diagnostics:
+  - `impact_analysis_status`
+  - `impact_primary_entity_count`
+  - `impact_related_entity_count`
+  - `impact_relationship_count`
+  - `impact_confidence`
+- Behavior:
+  - Impact analysis generated only for successful grounded answers.
+  - Fallback answers return `impact_analysis=null`.
+  - Deterministic metadata-based relationship extraction only.
+  - No LLM-generated dependency graph.
+  - No Neo4j or graph database usage.
+  - Safe non-blocking behavior.
+- Frontend behavior:
+  - Impact Analysis panel shown under assistant answers when `impact_analysis` exists.
+  - Shows impact confidence, primary entities, related entities, potential impacts, and relationship details.
+  - Hidden for fallback answers.
+- Validation:
+  - backend compile passed.
+  - frontend `npm run build` passed.
+  - QA login passed.
+  - Query tested: Which API is used to get appointment slots?
+  - `impact_analysis` returned medium confidence with primary/related entities and relationship summary.
+  - confidence badge, suggested chips, and enhanced sources panel still work.
+  - fallback query returned `impact_analysis=null` and preserved low confidence/no chips/source suppression.
+  - Frontend Vite used localhost:5176 due busy lower ports; this is operational only.
+- Known limitations:
+  - MVP is retrieval-assisted metadata relationship analysis, not full dependency graph.
+  - Impact confidence is based on relationship evidence, not guaranteed real-world dependency.
+  - Richness depends on extracted metadata quality such as `service_name`, `api_reference_id`, `service_group`, and `chunk_type`.
+
+## Current completed migrations
+- 7f1c2d9a4a10_add_auth_rbac_tables.py
+- a3b9f2d11c77_add_kb_fields_and_document_kb_id.py
+- f4d8a02b8a11_add_chat_session_knowledge_base_id.py
+- 9b7c1e2d4f90_add_document_classification_metadata.py
+- c2e4a9d71b33_expand_api_parameters_mandatory_optional.py
+- e1a5c8d2f744_expand_api_parameters_param_type.py
+
+## Current important files
+- app/core/security.py
+- app/api/deps.py
+- app/api/v1/endpoints/auth.py
+- app/api/v1/endpoints/users.py
+- app/api/v1/endpoints/knowledge_bases.py
+- app/api/v1/endpoints/query.py
+- app/api/v1/endpoints/ingestion.py
+- app/services/seed_service.py
+- app/services/retrieval_service.py
+- app/services/rag_service.py
+- scripts/step20_2_eval.py
+- scripts/step20_3_demo_validation.py
+- scripts/step20_3_demo_readiness_checklist.md
+- app/services/ingestion_service.py
+- app/services/openai_client.py
+- app/services/vector_dimension_resolver.py
+- app/models/user.py
+- app/models/role.py
+- app/models/permission.py
+- app/models/user_profile.py
+- app/models/knowledge_base.py
+- app/models/api_document.py
+- app/models/chat.py
+
+## Current important frontend files
+- frontend/src/api/client.ts
+- frontend/src/api/authApi.ts
+- frontend/src/api/kbApi.ts
+- frontend/src/api/queryApi.ts
+- frontend/src/api/ingestionApi.ts
+- frontend/src/auth/AuthContext.tsx
+- frontend/src/auth/ProtectedRoute.tsx
+- frontend/src/auth/roleAccess.ts
+- frontend/src/components/ChatSessionSidebar.tsx
+- frontend/src/components/Sidebar.tsx
+- frontend/src/components/TopNav.tsx
+- frontend/src/components/ProviderBadge.tsx
+- frontend/src/components/KBSelector.tsx
+- frontend/src/pages/ChatPage.tsx
+- frontend/src/pages/DocumentsPage.tsx
+- frontend/src/pages/DashboardPage.tsx
+- frontend/src/pages/NotAuthorizedPage.tsx
+- frontend/src/types/document.ts
+- frontend/src/utils/workspace.ts
+- frontend/README.md
+- scripts/step23_seed_demo_users.py
+- scripts/step23_validate_demo.py
+- docs/demo_runbook.md
+- docs/demo_script.md
+- docs/startup_checklist.md
+- docs/troubleshooting_checklist.md
+- docs/known_limitations.md
+- docs/demo_queries.md
+- docs/environment_freeze.md
+- docs/screenshots/README.md
+
+## Step 19: Ollama embeddings and vector retrieval
+
+### Step 19.1 completed — Ollama Connectivity Stabilization
+
+- Added retry handling for embeddings and generation
+- Default retry behavior is **3** attempts
+- Explicit timeout handling added:
+  - connect
+  - read
+  - write
+  - pool
+- Environment variables for timeouts and retries (optional overrides): `OLLAMA_TIMEOUT_CONNECT_SECONDS`, `OLLAMA_TIMEOUT_READ_SECONDS`, `OLLAMA_TIMEOUT_WRITE_SECONDS`, `OLLAMA_TIMEOUT_POOL_SECONDS`, `OLLAMA_RETRY_COUNT`, `OLLAMA_RETRY_DELAY_SECONDS`
+- Added structured Ollama diagnostics logging (success/failure/retry/elapsed time as applicable)
+- Added **generation_retry_failed** status when generation retries are exhausted
+- Added **embedding_retry_failed** status when embedding retries are exhausted
+- Backend falls back gracefully **without hanging**
+- API/Product ingestion and query tested successfully
+- Retrieval still commonly operates in **db_keyword_fallback** due to intermittent Ollama connectivity
+- Windows → Mac Ollama connectivity remains **intermittent**
+- passlib/bcrypt warning remains **non-blocking**
+
+### Step 19.2 completed — Embedding persistence and vector retrieval validation
+
+- Qdrant collection existence validated
+- Vector persistence validated
+- Vector dimensions validated (**768**)
+- Qdrant collection point counts verified
+- Added vector/fallback diagnostics under `debug=true`
+- Added vector retrieval observability fields:
+  - `vector_search_attempted`
+  - `vector_results_count`
+  - `vector_retrieval_outcome`
+  - `fallback_triggered`
+  - `fallback_reason`
+  - `source_metadata_coverage`
+- Product KB vector retrieval successfully validated
+- `vector_retrieval_outcome=vector_success` confirmed for Product KB
+- KB-isolated vector retrieval verified
+- Product vector metadata verified:
+  - `document_type`
+  - `product_name`
+  - `section_title`
+- Added Qdrant compatibility wrapper for `qdrant-client 1.17.1`
+- Compatibility fix supports:
+  - `search(...)`
+  - `query_points(...)`
+- Temporary Windows Ollama validation was used only for diagnostics
+- Official architecture restored back to Mac-hosted Ollama
+- Current runtime still commonly falls back due to intermittent Mac Ollama connectivity
+- Fallback behavior remains safe and stable
+
+## Step 20.1: Provider abstraction (OpenAI + Ollama)
+
+### Completed
+- Config-driven provider abstraction
+- OpenAI client integration
+- OpenAI embedding support
+- OpenAI generation support
+- Ollama compatibility preserved
+- Provider-aware Qdrant collection routing
+- Provider-aware vector dimensions
+- Provider-aware diagnostics
+- OpenAI end-to-end `vector_success` validation
+- Ollama regression validation
+
+### Provider-aware vector collections
+- `enterprise_api_docs`
+  - provider: ollama
+  - vector dimension: 768
+- `enterprise_api_docs_openai`
+  - provider: openai
+  - vector dimension: 1536
+
+### Current provider config
+- `OPENAI_API_KEY`
+- `LLM_PROVIDER`
+- `EMBEDDING_PROVIDER`
+- `OPENAI_LLM_MODEL`
+- `OPENAI_EMBEDDING_MODEL`
+- `OLLAMA_BASE_URL`
+- `OLLAMA_LLM_MODEL`
+- `OLLAMA_EMBEDDING_MODEL`
+
+### Current operational behavior
+- OpenAI path is stable and validated for POC/demo usage
+- Ollama remains the official/final architecture
+- Mac-hosted Ollama intermittency still exists operationally
+- Fallback behavior remains safe and non-blocking
+
+## Step 22.1: Frontend foundation setup
+
+### Completed
+- Frontend foundation scaffolded under `frontend/`
+- Auth context added
+- Protected routes added
+- JWT handling with `localStorage` (POC)
+- Role-aware sidebar added
+- KB selector added
+- Axios API client setup added
+
+### Current frontend routes
+- `/login`
+- `/`
+- `/chat`
+- `/admin`
+- `/documents`
+- `/not-authorized`
+
+## Step 22.2: Accessible KB endpoint + frontend KB visibility cleanup
+
+### Completed
+- Added backend endpoint: `GET /api/v1/knowledge-bases/me`
+- Frontend now uses backend-supported accessible KB visibility
+- Removed frontend session-derived KB visibility workaround
+
+### Accessible KB response fields in use
+- `access_level`
+- `can_query`
+- `can_upload`
+- `can_manage`
+- `can_view_documents`
+
+## Step 22.3: Full KB-aware chat UI
+
+### Completed
+- KB-aware query flow implemented
+- Full `ChatPage` implemented for ask/answer loop
+- Sources panel implemented
+- Diagnostics panel implemented (role-restricted)
+- Deterministic insufficient-context UX implemented
+- Loading and error handling implemented
+- In-memory chat history implemented
+
+### Diagnostics fields shown in UI
+- `llm_provider`
+- `embedding_provider`
+- `llm_model`
+- `embedding_model`
+- `retrieval_mode`
+- `vector_retrieval_outcome`
+- `vector_results_count`
+- `hybrid_fusion_used`
+- `rerank_strategy`
+- `vector_confidence_bucket`
+- `selected_prompt_chunk_count`
+- `dedup_chunks_removed`
+- `fallback_triggered`
+- `fallback_reason`
+- `llm_status`
+
+## Step 22.4: Chat session UX
+
+### Completed
+- Chat session sidebar added
+- New chat flow added
+- Persisted session continuation added
+- Previous session loading added
+- Cross-KB session safety added
+- Session filtering by accessible KBs added
+
+### Session architecture notes
+- Reused existing backend session APIs
+- No backend session redesign required
+- Frontend prevents cross-KB continuation
+
+## Frontend workspace notes
+- API Workspace
+- Product Workspace
+- HR Workspace
+- Recruitment Workspace (future)
+- Admin Workspace
+- Current implementation uses a shared chat UI with RBAC-aware behavior and KB-aware isolation.
+
+## Next planned step
+Step 24 — Post-Demo Hardening and Handoff (TBD)
+
+Planned focus:
+- capture and finalize real demo screenshots from placeholders
+- execute dry-run with presenter notes and timing
+- package signoff bundle (runbook + script + checklists + freeze notes)
+- optional post-demo cleanup and handoff notes
+
+## Known current limitations
+- Recruitment workspace is placeholder only
+- Admin management UI still placeholder
+- Advanced diagnostics export/filtering not implemented
+- Document preview not implemented
+- Manual UI screenshot capture still pending (placeholders prepared)
+- Mac Ollama intermittency remains operational caveat; OpenAI demo path remains stable
+
+## Constraints
+- Do not install Ollama on Windows
+- Do not use cloud services
+- Do not touch Neo4j in Phase 1
+- Do not use --reload
+- Use existing services/models/routes as source of truth
+- Preserve existing parser/chunking/ingestion/retrieval architecture
+- Do not redesign architecture
+- Do not redesign provider abstraction
+- Do not merge OpenAI and Ollama vector collections
+- Preserve provider-aware vector dimension handling

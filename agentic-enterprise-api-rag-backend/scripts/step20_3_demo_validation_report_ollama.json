@@ -1,0 +1,451 @@
+{
+  "timestamp_utc": "2026-05-07T07:56:58.823041+00:00",
+  "base_url": "http://127.0.0.1:8010",
+  "expected_provider": "ollama",
+  "observed_provider": {
+    "llm_provider": "ollama",
+    "embedding_provider": "ollama"
+  },
+  "health": {
+    "status_code": 200,
+    "body": {
+      "status": "healthy",
+      "app_name": "Agentic Enterprise API RAG Backend",
+      "environment": "local"
+    }
+  },
+  "login": {
+    "status_code": 200,
+    "user": {
+      "id": 1,
+      "email": "superadmin@local",
+      "full_name": "Default Super Admin"
+    },
+    "token_obtained": true
+  },
+  "query_set": [
+    {
+      "id": "api_lookup_01",
+      "type": "api_lookup",
+      "knowledge_base_id": 1,
+      "question": "API-REST-NOK-01 endpoint details"
+    },
+    {
+      "id": "api_lookup_02",
+      "type": "api_lookup",
+      "knowledge_base_id": 1,
+      "question": "API-REST-SAC-01 method and pattern"
+    },
+    {
+      "id": "api_workflow_01",
+      "type": "api_workflow",
+      "knowledge_base_id": 1,
+      "question": "Explain the integration flow for order service."
+    },
+    {
+      "id": "api_workflow_02",
+      "type": "api_workflow",
+      "knowledge_base_id": 1,
+      "question": "How can I submit order creation request?"
+    },
+    {
+      "id": "product_workflow_01",
+      "type": "product_workflow",
+      "knowledge_base_id": 2,
+      "question": "How do users start a new claim in Claims Portal?"
+    },
+    {
+      "id": "product_workflow_02",
+      "type": "product_workflow",
+      "knowledge_base_id": 2,
+      "question": "How do I configure notifications in Claims Portal workflow?"
+    },
+    {
+      "id": "product_howto_01",
+      "type": "product_howto",
+      "knowledge_base_id": 2,
+      "question": "Where is Claims Portal test doc section guidance?"
+    },
+    {
+      "id": "product_howto_02",
+      "type": "product_howto",
+      "knowledge_base_id": 2,
+      "question": "Workflow to validate order before submission"
+    },
+    {
+      "id": "mixed_semantic_01",
+      "type": "mixed_semantic",
+      "knowledge_base_id": 1,
+      "question": "Which API is used for claims portal order update flow?"
+    },
+    {
+      "id": "mixed_semantic_02",
+      "type": "mixed_semantic",
+      "knowledge_base_id": 2,
+      "question": "Claims Portal API integration prerequisites"
+    },
+    {
+      "id": "mixed_semantic_03",
+      "type": "mixed_semantic",
+      "knowledge_base_id": 2,
+      "question": "Section title for notifications in product docs"
+    },
+    {
+      "id": "insufficient_context_01",
+      "type": "insufficient_context",
+      "knowledge_base_id": 2,
+      "question": "What is the Kubernetes HPA YAML and Helm chart for Claims Portal deployment?"
+    }
+  ],
+  "summary": {
+    "query_total": 12,
+    "query_passed": 11,
+    "retrieval_mode_counts": {
+      "db_keyword_fallback": 10,
+      "vector": 2
+    },
+    "llm_status_counts": {
+      "generation_retry_failed": 11,
+      "fallback_no_llm": 1
+    },
+    "fallback_count": 10,
+    "hybrid_fusion_count": 0,
+    "overall_pass": false
+  },
+  "checks": {
+    "backend_health_ok": true,
+    "login_ok": true,
+    "api_kb_query_ok": true,
+    "product_kb_query_ok": true,
+    "diagnostics_populated": true,
+    "sources_returned": true,
+    "insufficient_context_safety_ok": false,
+    "provider_expectation_ok": true
+  },
+  "results": [
+    {
+      "id": "api_lookup_01",
+      "type": "api_lookup",
+      "knowledge_base_id": 1,
+      "question": "API-REST-NOK-01 endpoint details",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 380,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "api_lookup_02",
+      "type": "api_lookup",
+      "knowledge_base_id": 1,
+      "question": "API-REST-SAC-01 method and pattern",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 327,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "api_workflow_01",
+      "type": "api_workflow",
+      "knowledge_base_id": 1,
+      "question": "Explain the integration flow for order service.",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 380,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "api_workflow_02",
+      "type": "api_workflow",
+      "knowledge_base_id": 1,
+      "question": "How can I submit order creation request?",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "vector",
+      "llm_status": "fallback_no_llm",
+      "source_count": 0,
+      "answer_chars": 70,
+      "insufficient_expected": false,
+      "insufficient_matched": true,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 0,
+        "fallback_triggered": false,
+        "fallback_reason": null,
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 0,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "product_workflow_01",
+      "type": "product_workflow",
+      "knowledge_base_id": 2,
+      "question": "How do users start a new claim in Claims Portal?",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "vector",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 264,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": false,
+        "fallback_reason": null,
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "product_workflow_02",
+      "type": "product_workflow",
+      "knowledge_base_id": 2,
+      "question": "How do I configure notifications in Claims Portal workflow?",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 310,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "product_howto_01",
+      "type": "product_howto",
+      "knowledge_base_id": 2,
+      "question": "Where is Claims Portal test doc section guidance?",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 228,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "product_howto_02",
+      "type": "product_howto",
+      "knowledge_base_id": 2,
+      "question": "Workflow to validate order before submission",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 380,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "mixed_semantic_01",
+      "type": "mixed_semantic",
+      "knowledge_base_id": 1,
+      "question": "Which API is used for claims portal order update flow?",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 380,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "mixed_semantic_02",
+      "type": "mixed_semantic",
+      "knowledge_base_id": 2,
+      "question": "Claims Portal API integration prerequisites",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 327,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "mixed_semantic_03",
+      "type": "mixed_semantic",
+      "knowledge_base_id": 2,
+      "question": "Section title for notifications in product docs",
+      "http_status": 200,
+      "passed": true,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 288,
+      "insufficient_expected": false,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    },
+    {
+      "id": "insufficient_context_01",
+      "type": "insufficient_context",
+      "knowledge_base_id": 2,
+      "question": "What is the Kubernetes HPA YAML and Helm chart for Claims Portal deployment?",
+      "http_status": 200,
+      "passed": false,
+      "retrieval_mode": "db_keyword_fallback",
+      "llm_status": "generation_retry_failed",
+      "source_count": 5,
+      "answer_chars": 380,
+      "insufficient_expected": true,
+      "insufficient_matched": false,
+      "diagnostics": {
+        "llm_provider": "ollama",
+        "embedding_provider": "ollama",
+        "vector_collection_name": "enterprise_api_docs",
+        "vector_results_count": 5,
+        "fallback_triggered": true,
+        "fallback_reason": "embedding_failed",
+        "hybrid_fusion_used": null,
+        "retrieved_chunk_count": 5,
+        "selected_prompt_chunk_count": null,
+        "dedup_chunks_removed": null,
+        "diversity_caps_applied": null
+      }
+    }
+  ]
+}
