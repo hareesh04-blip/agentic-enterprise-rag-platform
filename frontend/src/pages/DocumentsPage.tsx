@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 import { AxiosError } from "axios";
 import { useNavigate } from "react-router-dom";
+import { documentGovernanceApi } from "../api/documentGovernanceApi";
 import { ingestionApi } from "../api/ingestionApi";
 import { useAuth } from "../auth/AuthContext";
 import type { DocumentItem, DocumentType, UploadDocumentResponse } from "../types/document";
@@ -41,6 +42,9 @@ export function DocumentsPage() {
 
   const [documentTypeFilter, setDocumentTypeFilter] = useState<"all" | DocumentType>("all");
   const [productNameFilter, setProductNameFilter] = useState("");
+  const [activeOnlyFilter, setActiveOnlyFilter] = useState(false);
+  const [failedOnlyFilter, setFailedOnlyFilter] = useState(false);
+  const [govBusyId, setGovBusyId] = useState<number | null>(null);
 
   const [file, setFile] = useState<File | null>(null);
   const [uploadDocumentType, setUploadDocumentType] = useState<DocumentType>("api");
@@ -64,6 +68,8 @@ export function DocumentsPage() {
         knowledge_base_id: selectedKb.id,
         document_type: documentTypeFilter === "all" ? undefined : documentTypeFilter,
         product_name: productNameFilter.trim() || undefined,
+        active_only: activeOnlyFilter ? true : undefined,
+        failed_ingestion_only: failedOnlyFilter ? true : undefined,
       });
       setDocuments(response.documents || []);
     } catch (err) {
@@ -94,6 +100,25 @@ export function DocumentsPage() {
   const onApplyFilters = async (event: FormEvent) => {
     event.preventDefault();
     await fetchDocuments();
+  };
+
+  const runGovernance = async (documentId: number, action: "deactivate" | "reactivate" | "reindex" | "remove_vectors") => {
+    setGovBusyId(documentId);
+    try {
+      if (action === "deactivate") await documentGovernanceApi.deactivate(documentId);
+      else if (action === "reactivate") await documentGovernanceApi.reactivate(documentId);
+      else if (action === "reindex") await documentGovernanceApi.reindex(documentId);
+      else await documentGovernanceApi.removeVectors(documentId);
+      await fetchDocuments();
+    } catch (err) {
+      if (err instanceof AxiosError) {
+        setListError(typeof err.response?.data?.detail === "string" ? err.response.data.detail : "Governance action failed.");
+      } else {
+        setListError("Governance action failed.");
+      }
+    } finally {
+      setGovBusyId(null);
+    }
   };
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -158,24 +183,75 @@ export function DocumentsPage() {
               {doc.document_type || "unknown"}
             </span>
           </td>
+          <td className="px-3 py-2">
+            {doc.is_active_document === false ? (
+              <span className="rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs text-rose-800">Inactive</span>
+            ) : (
+              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs text-emerald-800">Active</span>
+            )}
+          </td>
           <td className="px-3 py-2">{doc.product_name || "-"}</td>
           <td className="px-3 py-2">{doc.source_domain || "-"}</td>
           <td className="px-3 py-2">{doc.document_version || "-"}</td>
-          <td className="px-3 py-2">{doc.chunk_count ?? "-"}</td>
           <td className="px-3 py-2">
-            <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${badgeColorForStatus(doc.embedding_status)}`}>
-              {doc.embedding_status || "-"}
+            {doc.chunk_count ?? "-"}
+            {doc.vector_chunk_count != null ? ` / ${doc.vector_chunk_count}` : ""}
+          </td>
+          <td className="max-w-[140px] truncate px-3 py-2 text-xs" title={doc.ingestion_status ?? ""}>
+            <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${badgeColorForStatus(doc.ingestion_status)}`}>
+              {doc.ingestion_status || "-"}
             </span>
           </td>
-          <td className="px-3 py-2">
-            <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${badgeColorForStatus(doc.vector_store_status)}`}>
-              {doc.vector_store_status || "-"}
-            </span>
+          <td className="max-w-[100px] truncate px-3 py-2 text-xs text-slate-600" title={doc.embedding_provider ?? ""}>
+            {doc.embedding_provider || "-"}
           </td>
-          <td className="px-3 py-2">{doc.created_at ? new Date(doc.created_at).toLocaleString() : "-"}</td>
+          <td className="whitespace-nowrap px-3 py-2 text-xs text-slate-600">
+            {doc.upload_timestamp ? new Date(doc.upload_timestamp).toLocaleString() : doc.created_at ? new Date(doc.created_at).toLocaleString() : "-"}
+          </td>
+          <td className="px-3 py-2 text-xs text-slate-600">{doc.ingestion_run_id ?? "—"}</td>
+          <td className="px-3 py-2">
+            {canUpload ? (
+              <div className="flex flex-wrap gap-1">
+                <button
+                  type="button"
+                  disabled={govBusyId === doc.id || doc.is_active_document === false}
+                  onClick={() => void runGovernance(doc.id, "deactivate")}
+                  className="rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] hover:bg-slate-50 disabled:opacity-40"
+                >
+                  Deactivate
+                </button>
+                <button
+                  type="button"
+                  disabled={govBusyId === doc.id || doc.is_active_document !== false}
+                  onClick={() => void runGovernance(doc.id, "reactivate")}
+                  className="rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] hover:bg-slate-50 disabled:opacity-40"
+                >
+                  Activate
+                </button>
+                <button
+                  type="button"
+                  disabled={govBusyId === doc.id}
+                  onClick={() => void runGovernance(doc.id, "reindex")}
+                  className="rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[11px] text-blue-900 hover:bg-blue-100 disabled:opacity-40"
+                >
+                  Re-index
+                </button>
+                <button
+                  type="button"
+                  disabled={govBusyId === doc.id}
+                  onClick={() => void runGovernance(doc.id, "remove_vectors")}
+                  className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-900 hover:bg-amber-100 disabled:opacity-40"
+                >
+                  Drop vectors
+                </button>
+              </div>
+            ) : (
+              <span className="text-xs text-slate-400">—</span>
+            )}
+          </td>
         </tr>
       )),
-    [documents],
+    [documents, canUpload, govBusyId],
   );
 
   if (!selectedKb) {
@@ -245,7 +321,25 @@ export function DocumentsPage() {
               className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
             />
           </label>
-          <div className="flex items-end">
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              checked={activeOnlyFilter}
+              onChange={(e) => setActiveOnlyFilter(e.target.checked)}
+              className="rounded border-slate-300"
+            />
+            Active only
+          </label>
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              checked={failedOnlyFilter}
+              onChange={(e) => setFailedOnlyFilter(e.target.checked)}
+              className="rounded border-slate-300"
+            />
+            Failed ingestion only
+          </label>
+          <div className="flex items-end md:col-span-2">
             <button
               type="submit"
               disabled={listLoading}
@@ -273,13 +367,16 @@ export function DocumentsPage() {
                 <tr>
                   <th className="px-3 py-2">File</th>
                   <th className="px-3 py-2">Type</th>
+                  <th className="px-3 py-2">Active</th>
                   <th className="px-3 py-2">Product</th>
                   <th className="px-3 py-2">Domain</th>
                   <th className="px-3 py-2">Version</th>
-                  <th className="px-3 py-2">Chunks</th>
-                  <th className="px-3 py-2">Embedding</th>
-                  <th className="px-3 py-2">Vector</th>
-                  <th className="px-3 py-2">Created</th>
+                  <th className="px-3 py-2">Chunks / vectors</th>
+                  <th className="px-3 py-2">Ingestion</th>
+                  <th className="px-3 py-2">Embed provider</th>
+                  <th className="px-3 py-2">Upload</th>
+                  <th className="px-3 py-2">Run</th>
+                  <th className="px-3 py-2">Governance</th>
                 </tr>
               </thead>
               <tbody>{tableRows}</tbody>
@@ -367,6 +464,7 @@ export function DocumentsPage() {
             <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
               <p className="mb-2 font-semibold text-slate-800">Upload Result</p>
               <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                <p>ingestion_run_id: {uploadResult.ingestion_run_id ?? "N/A"}</p>
                 <p>chunk_count: {uploadResult.chunk_count ?? "N/A"}</p>
                 <p>vector_collection_name: {uploadResult.vector_collection_name ?? "N/A"}</p>
                 <p>vector_embedding_dimension: {uploadResult.vector_embedding_dimension ?? "N/A"}</p>

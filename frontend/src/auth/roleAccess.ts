@@ -31,6 +31,10 @@ export const canViewAdmin = (user: CurrentUser | null): boolean =>
   hasPermission(user, "users.manage") ||
   hasPermission(user, "knowledge_bases.manage");
 
+/** System health / status dashboard: super_admin and admin roles only. */
+export const canViewSystemHealth = (user: CurrentUser | null): boolean =>
+  hasRole(user, ["super_admin", "admin"]);
+
 export const canViewDiagnostics = (user: CurrentUser | null): boolean =>
   canViewAdmin(user) ||
   hasRole(user, ["qa", "tester"]) ||

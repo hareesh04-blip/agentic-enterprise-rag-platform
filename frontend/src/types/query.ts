@@ -22,6 +22,12 @@ export interface QuerySourceItem {
   document_version?: string | null;
   knowledge_base_id?: number | null;
   knowledge_base_name?: string | null;
+  document_id?: number | null;
+  /** ISO timestamp from document.uploaded_at when available */
+  upload_timestamp?: string | null;
+  ingestion_run_id?: number | null;
+  /** False when source chunk belongs to a governance-deactivated document */
+  is_active_document?: boolean | null;
 }
 
 export interface QueryResponse {
@@ -58,6 +64,7 @@ export interface ChatSession {
 }
 
 export interface ChatMessage {
+  id?: number | null;
   role: "user" | "assistant";
   content: string;
   sources_json: QuerySourceItem[] | null;

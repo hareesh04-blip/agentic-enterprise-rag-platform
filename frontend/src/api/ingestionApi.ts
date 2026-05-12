@@ -7,6 +7,8 @@ export const ingestionApi = {
       knowledge_base_id: filters.knowledge_base_id,
       document_type: filters.document_type || undefined,
       product_name: filters.product_name?.trim() || undefined,
+      active_only: filters.active_only === true ? true : undefined,
+      failed_ingestion_only: filters.failed_ingestion_only === true ? true : undefined,
     };
     const { data } = await apiClient.get<ListDocumentsResponse>("/ingestion/documents", { params });
     return data;

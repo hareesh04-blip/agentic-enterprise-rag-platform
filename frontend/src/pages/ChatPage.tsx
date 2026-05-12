@@ -2,15 +2,24 @@ import { useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 import { AxiosError } from "axios";
 import { useNavigate } from "react-router-dom";
+import { feedbackApi } from "../api/feedbackApi";
+import type { QueryFeedbackRating } from "../api/feedbackApi";
 import { queryApi } from "../api/queryApi";
 import { useAuth } from "../auth/AuthContext";
 import { canViewDiagnostics } from "../auth/roleAccess";
 import { ChatSessionSidebar } from "../components/ChatSessionSidebar";
+import { DemoScenarioCards } from "../components/DemoScenarioCards";
+import { ChunkTypeBadge } from "../components/retrieval/ChunkTypeBadge";
+import { ConfidenceExplainPanel } from "../components/retrieval/ConfidenceExplainPanel";
+import { RetrievalJourneyPanel } from "../components/retrieval/RetrievalJourneyPanel";
+import { RetrievalMetricsCards } from "../components/retrieval/RetrievalMetricsCards";
+import { answerProvenanceHints } from "../lib/diagnosticsHelpers";
 import type { ChatMessage, ChatSession, QueryResponse, QuerySourceItem } from "../types/query";
 import { useEffect } from "react";
 
 interface ChatMessageView {
   id: string;
+  dbMessageId?: number;
   role: "user" | "assistant";
   content: string;
   sources: QuerySourceItem[] | null;
@@ -28,6 +37,26 @@ const INSUFFICIENT_CONTEXT_STATUS = "fallback_insufficient_context";
 const INSUFFICIENT_CONTEXT_ANSWER =
   "I could not find enough information in the selected knowledge base to answer this confidently.";
 const PROVIDER_SNAPSHOT_KEY = "demo_provider_snapshot";
+const STREAMING_PREF_KEY = "aerag_streaming_chat";
+
+const AGENT_STEP_LABELS: Record<string, string> = {
+  classify_intent: "Classify intent",
+  plan_retrieval: "Plan retrieval",
+  retrieve_context: "Retrieve context",
+  validate_context: "Validate context",
+  generate_answer: "Generate answer",
+  package_response: "Package response",
+};
+
+function readStreamingPref(): boolean {
+  try {
+    const v = window.localStorage.getItem(STREAMING_PREF_KEY);
+    if (v === null) return true;
+    return v === "1" || v === "true";
+  } catch {
+    return true;
+  }
+}
 
 function sourceTitle(source: QuerySourceItem): string {
   return source.file_name || source.api_reference_id || source.service_name || "Untitled Source";
@@ -36,19 +65,6 @@ function sourceTitle(source: QuerySourceItem): string {
 function chunkPreview(source: QuerySourceItem): string | null {
   const raw = source.chunk_type || source.section_title || source.service_pattern || null;
   return raw ? String(raw) : null;
-}
-
-function chunkTypeLabel(chunkType?: string | null): string {
-  const normalized = String(chunkType || "").toLowerCase();
-  if (normalized.includes("authentication")) return "Authentication";
-  if (normalized.includes("request_parameters")) return "Request Parameters";
-  if (normalized.includes("response_parameters")) return "Response Parameters";
-  if (normalized.includes("failed_response") || normalized.includes("error")) return "Error Response";
-  if (normalized.includes("api_overview")) return "API Overview";
-  if (normalized.includes("product_section")) return "Product Section";
-  if (normalized.includes("generic_section")) return "Generic Section";
-  if (normalized.includes("api_metadata")) return "API Metadata";
-  return "Source Chunk";
 }
 
 function whyMatchedText(source: QuerySourceItem): string {
@@ -97,17 +113,6 @@ function groupSourceTitle(source: QuerySourceItem): string {
   return source.file_name || source.product_name || source.source_domain || source.document_type || "Unknown Source";
 }
 
-function confidenceBadgeClasses(label?: string | null): string {
-  const normalized = String(label || "").toLowerCase();
-  if (normalized === "high") {
-    return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  }
-  if (normalized === "medium") {
-    return "border-amber-200 bg-amber-50 text-amber-700";
-  }
-  return "border-rose-200 bg-rose-50 text-rose-700";
-}
-
 function impactBadgeClasses(label?: string | null): string {
   const normalized = String(label || "").toLowerCase();
   if (normalized === "high") {
@@ -128,6 +133,13 @@ function renderEntityLabel(entity: Record<string, any>, fallback: string): strin
   return fallback;
 }
 
+function precedingUserQuestion(messages: ChatMessageView[], assistantIndex: number): string {
+  for (let i = assistantIndex - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messages[i].content;
+  }
+  return "";
+}
+
 export function ChatPage() {
   const { user, selectedKb, accessibleKbs, setSelectedKbById, logout } = useAuth();
   const navigate = useNavigate();
@@ -137,12 +149,17 @@ export function ChatPage() {
   const [isLoadingSessionMessages, setIsLoadingSessionMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [feedbackNotice, setFeedbackNotice] = useState<string | null>(null);
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState<Record<string, boolean>>({});
+  const [feedbackCommentForId, setFeedbackCommentForId] = useState<string | null>(null);
+  const [feedbackDraft, setFeedbackDraft] = useState<Record<string, string>>({});
   const [messages, setMessages] = useState<ChatMessageView[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [activeSessionKbId, setActiveSessionKbId] = useState<number | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [expandedSourceCards, setExpandedSourceCards] = useState<Record<string, boolean>>({});
+  const [streamingEnabled, setStreamingEnabled] = useState(readStreamingPref);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
   const canQuerySelectedKb = Boolean(selectedKb?.can_query);
@@ -158,6 +175,30 @@ export function ChatPage() {
   const sourceCount = latestAssistantIsFallback ? 0 : latestAssistant?.sources?.length ?? 0;
   const disableSubmit = isSubmitting || !question.trim() || !selectedKb || !canQuerySelectedKb;
   const accessibleKbIds = useMemo(() => new Set(accessibleKbs.map((kb) => kb.id)), [accessibleKbs]);
+
+  const agentTraceSummary = useMemo(() => {
+    const steps = latestDiagnostics?.agent_steps;
+    if (!Array.isArray(steps)) return null;
+    let intent: string | undefined;
+    let effectiveTopK: number | undefined;
+    let chunkCount: number | undefined;
+    let insufficient: boolean | undefined;
+    for (const raw of steps) {
+      const s = raw as { step?: string; details?: Record<string, unknown> };
+      if (s.step === "classify_intent" && s.details?.intent != null) intent = String(s.details.intent);
+      if (s.step === "plan_retrieval" && typeof s.details?.effective_top_k === "number") effectiveTopK = s.details.effective_top_k;
+      if (s.step === "retrieve_context" && typeof s.details?.chunk_count === "number") chunkCount = s.details.chunk_count;
+      if (s.step === "validate_context" && typeof s.details?.insufficient_recommended === "boolean")
+        insufficient = s.details.insufficient_recommended;
+    }
+    return { intent, effectiveTopK, chunkCount, insufficient };
+  }, [latestDiagnostics?.agent_steps]);
+
+  const agentTraceAvailable = Boolean(
+    latestDiagnostics?.agent_orchestration_enabled === true &&
+      Array.isArray(latestDiagnostics?.agent_steps) &&
+      (latestDiagnostics.agent_steps as unknown[]).length > 0,
+  );
 
   const diagnosticsRows = useMemo(
     () =>
@@ -203,6 +244,14 @@ export function ChatPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, isSubmitting]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STREAMING_PREF_KEY, streamingEnabled ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [streamingEnabled]);
 
   const loadSessions = async () => {
     setIsLoadingSessions(true);
@@ -251,11 +300,45 @@ export function ChatPage() {
     setError(fallback);
   };
 
+  const submitAnswerFeedback = async (
+    message: ChatMessageView,
+    assistantIndex: number,
+    rating: QueryFeedbackRating,
+    comment?: string,
+  ) => {
+    if (!selectedKb) return;
+    const questionText = precedingUserQuestion(messages, assistantIndex).trim();
+    if (!questionText) {
+      setError("Could not determine the question for this answer.");
+      return;
+    }
+    try {
+      await feedbackApi.submitQueryFeedback({
+        knowledge_base_id: selectedKb.id,
+        question_text: questionText,
+        answer_text: message.content,
+        rating,
+        comment: comment?.trim() ? comment.trim() : undefined,
+        session_id: activeSessionId ?? undefined,
+        message_id: message.dbMessageId ?? undefined,
+      });
+      setFeedbackSubmitted((prev) => ({ ...prev, [message.id]: true }));
+      setFeedbackCommentForId(null);
+      setFeedbackNotice("Feedback submitted.");
+      window.setTimeout(() => setFeedbackNotice(null), 4000);
+    } catch (err) {
+      handleError(err, "Failed to submit feedback.");
+    }
+  };
+
   const startNewChat = () => {
     setActiveSessionId(null);
     setActiveSessionKbId(null);
     setMessages([]);
     setError(null);
+    setFeedbackSubmitted({});
+    setFeedbackCommentForId(null);
+    setFeedbackDraft({});
     setNotice("Started a new chat in the currently selected KB.");
   };
 
@@ -280,7 +363,8 @@ export function ChatPage() {
         return;
       }
       const mapped: ChatMessageView[] = payload.messages.map((msg: ChatMessage, idx) => ({
-        id: `${payload.session_id}-${idx}-${msg.role}`,
+        id: typeof msg.id === "number" ? `db-msg-${msg.id}` : `${payload.session_id}-${idx}-${msg.role}`,
+        dbMessageId: typeof msg.id === "number" ? msg.id : undefined,
         role: msg.role,
         content: msg.content,
         sources: msg.sources_json,
@@ -288,6 +372,9 @@ export function ChatPage() {
         kbName: payload.knowledge_base_name,
       }));
       setMessages(mapped);
+      setFeedbackSubmitted({});
+      setFeedbackCommentForId(null);
+      setFeedbackDraft({});
       setActiveSessionId(payload.session_id);
       setActiveSessionKbId(payload.knowledge_base_id);
       setNotice(`Loaded session #${payload.session_id}.`);
@@ -308,15 +395,92 @@ export function ChatPage() {
     setError(null);
     setNotice(null);
     setIsSubmitting(true);
+
+    const payload = {
+      project_id: 1,
+      knowledge_base_id: selectedKb.id,
+      question: prompt,
+      top_k: 5,
+      session_id: activeSessionId ?? undefined,
+      debug: true,
+    };
+
+    const uid = `u-${Date.now()}`;
+    const aid = `a-${Date.now() + 1}`;
+
+    const applyAssistantFromResponse = (response: QueryResponse) => {
+      const providerSnapshot = {
+        llm_provider: String(response.diagnostics?.llm_provider ?? "backend-configured"),
+        llm_status: response.llm_status,
+      };
+      window.localStorage.setItem(PROVIDER_SNAPSHOT_KEY, JSON.stringify(providerSnapshot));
+      setActiveSessionId(response.session_id);
+      setActiveSessionKbId(response.knowledge_base_id);
+      setQuestion("");
+    };
+
     try {
-      const response: QueryResponse = await queryApi.askQuestion({
-        project_id: 1,
-        knowledge_base_id: selectedKb.id,
-        question: prompt,
-        top_k: 5,
-        session_id: activeSessionId ?? undefined,
-        debug: true,
-      });
+      if (streamingEnabled) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: uid,
+            role: "user",
+            content: prompt,
+            sources: null,
+            createdAt: new Date().toISOString(),
+            kbName: selectedKb.name,
+          },
+          {
+            id: aid,
+            role: "assistant",
+            content: "",
+            sources: null,
+            suggestedQuestions: undefined,
+            confidence: undefined,
+            impactAnalysis: undefined,
+            createdAt: new Date().toISOString(),
+            kbName: selectedKb.name,
+            llmStatus: undefined,
+            retrievalMode: undefined,
+            diagnostics: undefined,
+          },
+        ]);
+        try {
+          const response = await queryApi.askQuestionStream(payload, {
+            onToken: (text) => {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === aid ? { ...m, content: `${m.content}${text}` } : m)),
+              );
+            },
+          });
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aid
+                ? {
+                    ...m,
+                    content: response.answer,
+                    sources: response.sources,
+                    suggestedQuestions: response.suggested_questions,
+                    confidence: response.confidence,
+                    impactAnalysis: response.impact_analysis,
+                    llmStatus: response.llm_status,
+                    retrievalMode: response.retrieval_mode,
+                    diagnostics: response.diagnostics,
+                  }
+                : m,
+            ),
+          );
+          applyAssistantFromResponse(response);
+          await loadSessions();
+          return;
+        } catch {
+          setMessages((prev) => prev.filter((m) => m.id !== uid && m.id !== aid));
+          setNotice("Streaming unavailable; using standard response.");
+        }
+      }
+
+      const response: QueryResponse = await queryApi.askQuestion(payload);
       setMessages((prev) => [
         ...prev,
         {
@@ -342,14 +506,7 @@ export function ChatPage() {
           diagnostics: response.diagnostics,
         },
       ]);
-      const providerSnapshot = {
-        llm_provider: String(response.diagnostics?.llm_provider ?? "backend-configured"),
-        llm_status: response.llm_status,
-      };
-      window.localStorage.setItem(PROVIDER_SNAPSHOT_KEY, JSON.stringify(providerSnapshot));
-      setActiveSessionId(response.session_id);
-      setActiveSessionKbId(response.knowledge_base_id);
-      setQuestion("");
+      applyAssistantFromResponse(response);
       await loadSessions();
     } catch (err) {
       handleError(err);
@@ -399,6 +556,9 @@ export function ChatPage() {
     <div className="grid grid-cols-1 gap-4 xl:grid-cols-[2fr_1fr]">
       <section className="space-y-4">
         {notice ? <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-700">{notice}</div> : null}
+        {feedbackNotice ? (
+          <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">{feedbackNotice}</div>
+        ) : null}
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">KB-aware chat</p>
           <p className="mt-1 text-sm text-slate-700">
@@ -408,6 +568,14 @@ export function ChatPage() {
             Active session: <span className="font-semibold">{activeSessionId ?? "New chat"}</span>
           </p>
         </div>
+
+        <DemoScenarioCards
+          disabled={disableSubmit}
+          onSelect={async (presetQuestion) => {
+            setQuestion(presetQuestion);
+            await submitQuestion(presetQuestion);
+          }}
+        />
 
         <form onSubmit={onSubmit} className="space-y-3 rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
           <label className="block text-sm font-medium text-slate-700" htmlFor="chat-question">
@@ -422,7 +590,7 @@ export function ChatPage() {
             placeholder="Enter your question. Press Enter to send, Shift+Enter for newline."
             className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm"
           />
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <button
               type="submit"
               disabled={disableSubmit}
@@ -430,6 +598,15 @@ export function ChatPage() {
             >
               {isSubmitting ? "Asking..." : "Ask"}
             </button>
+            <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                checked={streamingEnabled}
+                onChange={(e) => setStreamingEnabled(e.target.checked)}
+                className="rounded border-slate-300"
+              />
+              Streaming response
+            </label>
             <p className="text-xs text-slate-500">Query payload includes selected `knowledge_base_id` and `debug=true`.</p>
           </div>
           {error ? (
@@ -452,13 +629,19 @@ export function ChatPage() {
               Ask your first question in this workspace. Responses are scoped to the selected knowledge base.
             </div>
           ) : null}
-          {messages.map((message) => {
+          {messages.map((message, msgIndex) => {
             const isAssistant = message.role === "assistant";
             const isInsufficient = message.llmStatus === INSUFFICIENT_CONTEXT_STATUS;
-            const hasConfidence = isAssistant && !isSubmitting && !!message.confidence;
-            const confidenceLabel = String(message.confidence?.label || "low").toLowerCase();
-            const confidenceScore = Math.round(Math.max(0, Math.min(1, Number(message.confidence?.score ?? 0))) * 100);
-            const confidenceReasons = Array.isArray(message.confidence?.reasons) ? message.confidence?.reasons : [];
+            const diagKeys =
+              message.diagnostics && typeof message.diagnostics === "object"
+                ? Object.keys(message.diagnostics as object).length
+                : 0;
+            const showConfidenceExplain =
+              isAssistant &&
+              !isSubmitting &&
+              (message.confidence != null || diagKeys > 0);
+            const userQuestionForMsg = precedingUserQuestion(messages, msgIndex);
+            const provenanceHints = answerProvenanceHints(message.sources, message.diagnostics);
             const showSuggestedQuestions =
               Boolean(selectedKb) &&
               isAssistant &&
@@ -486,16 +669,50 @@ export function ChatPage() {
                     <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                       {isAssistant ? "Assistant answer" : "User question"}
                     </p>
-                    {hasConfidence ? (
-                      <span
-                        className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${confidenceBadgeClasses(confidenceLabel)}`}
-                        title={confidenceReasons.length ? confidenceReasons.join(" | ") : "Confidence derived from retrieval signals"}
-                      >
-                        {`${confidenceLabel.charAt(0).toUpperCase()}${confidenceLabel.slice(1)} confidence (${confidenceScore}%)`}
-                      </span>
-                    ) : null}
                   </div>
+                  {showConfidenceExplain ? (
+                    <div className="mt-2">
+                      <ConfidenceExplainPanel
+                        confidence={message.confidence}
+                        diagnostics={message.diagnostics}
+                        llmStatus={message.llmStatus}
+                      />
+                    </div>
+                  ) : null}
                   <p className="mt-1 whitespace-pre-wrap text-sm text-slate-900">{message.content}</p>
+                  {isAssistant && provenanceHints.length ? (
+                    <ul className="mt-2 space-y-1 text-[11px] text-slate-600">
+                      {provenanceHints.map((hint) => (
+                        <li key={hint} className="flex items-start gap-1">
+                          <span aria-hidden className="text-indigo-500">
+                            ●
+                          </span>
+                          <span>{hint}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {isAssistant && message.diagnostics && diagKeys > 0 ? (
+                    <details className="mt-3 rounded-md border border-slate-200 bg-white p-3 text-xs shadow-sm">
+                      <summary className="cursor-pointer font-semibold text-slate-800">
+                        How this answer was generated
+                      </summary>
+                      <div className="mt-3 space-y-3">
+                        <RetrievalMetricsCards
+                          diagnostics={message.diagnostics}
+                          llmProvider={String(message.diagnostics?.llm_provider ?? "")}
+                          answerCharCount={message.content.length}
+                        />
+                        <RetrievalJourneyPanel
+                          question={userQuestionForMsg || message.content}
+                          diagnostics={message.diagnostics}
+                          llmStatus={message.llmStatus}
+                          mode="full"
+                          answerCharCount={message.content.length}
+                        />
+                      </div>
+                    </details>
+                  ) : null}
                 </div>
                 {isAssistant ? (
                   <div>
@@ -506,6 +723,71 @@ export function ChatPage() {
                     >
                       Copy answer
                     </button>
+                  </div>
+                ) : null}
+
+                {isAssistant && message.content.trim() ? (
+                  <div className="mt-2 rounded-md border border-slate-200 bg-white/80 p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs text-slate-600">Rate this answer</span>
+                      <button
+                        type="button"
+                        disabled={Boolean(feedbackSubmitted[message.id])}
+                        onClick={() => {
+                          setFeedbackCommentForId(null);
+                          void submitAnswerFeedback(message, msgIndex, "thumbs_up");
+                        }}
+                        className="rounded border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label="Thumbs up"
+                      >
+                        👍 Helpful
+                      </button>
+                      <button
+                        type="button"
+                        disabled={Boolean(feedbackSubmitted[message.id])}
+                        onClick={() =>
+                          setFeedbackCommentForId((prev) => (prev === message.id ? null : message.id))
+                        }
+                        className="rounded border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label="Thumbs down"
+                      >
+                        👎 Not helpful
+                      </button>
+                      {feedbackSubmitted[message.id] ? (
+                        <span className="text-xs font-medium text-emerald-700">Feedback submitted.</span>
+                      ) : null}
+                    </div>
+                    {feedbackCommentForId === message.id && !feedbackSubmitted[message.id] ? (
+                      <div className="mt-2 space-y-2">
+                        <label className="block text-xs font-medium text-slate-600" htmlFor={`feedback-comment-${message.id}`}>
+                          Optional comment
+                        </label>
+                        <textarea
+                          id={`feedback-comment-${message.id}`}
+                          rows={2}
+                          value={feedbackDraft[message.id] ?? ""}
+                          onChange={(e) =>
+                            setFeedbackDraft((prev) => ({ ...prev, [message.id]: e.target.value }))
+                          }
+                          className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                          placeholder="What was wrong or missing?"
+                        />
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void submitAnswerFeedback(
+                              message,
+                              msgIndex,
+                              "thumbs_down",
+                              feedbackDraft[message.id],
+                            )
+                          }
+                          className="rounded bg-slate-800 px-3 py-1 text-xs font-semibold text-white hover:bg-slate-700"
+                        >
+                          Submit feedback
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
 
@@ -673,6 +955,9 @@ export function ChatPage() {
         />
         <section className="rounded-lg border border-slate-200 bg-white p-4">
           <h3 className="text-sm font-semibold text-slate-900">Sources ({sourceCount})</h3>
+          <p className="mt-1 text-[11px] text-slate-500">
+            Chunks below were selected for the LLM prompt (reranked retrieval subset).
+          </p>
           {latestAssistant?.sources?.length && !latestAssistantIsFallback ? (
             <div className="mt-3 space-y-3">
               {groupedSources.map((group) => (
@@ -686,7 +971,6 @@ export function ChatPage() {
                   <div className="space-y-2">
                     {group.items.map(({ source, index, key }) => {
                       const expanded = Boolean(expandedSourceCards[key]);
-                      const chunkLabel = chunkTypeLabel(source.chunk_type);
                       const relevanceLabel = sourceRelevanceLabel(source, index, latestAssistant.sources?.length ?? 0);
                       const asyncIndicator =
                         String(source.service_pattern || "").toLowerCase().includes("asynch") ||
@@ -712,9 +996,15 @@ export function ChatPage() {
                               <span className="text-[11px] text-slate-500">{expanded ? "Hide" : "Show"}</span>
                             </div>
                             <div className="mt-2 flex flex-wrap gap-1">
-                              <span className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700">
-                                {chunkLabel}
+                              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-800">
+                                Prompt context
                               </span>
+                              <ChunkTypeBadge chunkType={source.chunk_type} showRaw />
+                              {typeof source.score === "number" ? (
+                                <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-700">
+                                  score {source.score.toFixed(4)}
+                                </span>
+                              ) : null}
                               <span className={`rounded-full border px-2 py-0.5 text-[11px] ${sourceRelevanceClasses(relevanceLabel)}`}>
                                 {relevanceLabel} relevance
                               </span>
@@ -751,6 +1041,11 @@ export function ChatPage() {
                               <p>section_title: {source.section_title ?? "N/A"}</p>
                               <p>source_domain: {source.source_domain ?? "N/A"}</p>
                               <p>document_version: {source.document_version ?? "N/A"}</p>
+                              <p>knowledge_base_name: {source.knowledge_base_name ?? "N/A"}</p>
+                              <p>document_id: {source.document_id ?? "N/A"}</p>
+                              <p>upload_timestamp: {source.upload_timestamp ?? "N/A"}</p>
+                              <p>ingestion_run_id: {source.ingestion_run_id ?? "N/A"}</p>
+                              <p>is_active_document: {String(source.is_active_document ?? "N/A")}</p>
                               <p>preview: {chunkPreview(source) ?? "N/A"}</p>
                             </div>
                           </div>
@@ -807,6 +1102,81 @@ export function ChatPage() {
                         <span className="font-semibold">{row.key}:</span> {String(row.value ?? "N/A")}
                       </p>
                     ))}
+                </div>
+                <div className="mt-2 rounded border border-violet-100 bg-violet-50/70 p-2">
+                  <p className="mb-1 font-semibold text-slate-800">Session memory</p>
+                  <p>
+                    <span className="font-semibold">conversation_summary_used:</span>{" "}
+                    {String(latestDiagnostics?.conversation_summary_used ?? "n/a")}
+                  </p>
+                  <p>
+                    <span className="font-semibold">conversation_summary_message_count:</span>{" "}
+                    {String(latestDiagnostics?.conversation_summary_message_count ?? "n/a")}
+                  </p>
+                  <p>
+                    <span className="font-semibold">conversation_summary_updated_at:</span>{" "}
+                    {latestDiagnostics?.conversation_summary_updated_at != null
+                      ? String(latestDiagnostics.conversation_summary_updated_at)
+                      : "n/a"}
+                  </p>
+                </div>
+                <div className="mt-2 rounded border border-emerald-100 bg-emerald-50/60 p-2">
+                  <p className="mb-1 font-semibold text-slate-800">Agent trace</p>
+                  {agentTraceAvailable ? (
+                    <div className="space-y-2">
+                      {agentTraceSummary ? (
+                        <div className="flex flex-wrap gap-x-3 gap-y-1 border-b border-emerald-100/80 pb-2 text-[11px] text-slate-700">
+                          {agentTraceSummary.intent != null ? (
+                            <span>
+                              <span className="font-semibold">Detected intent:</span> {agentTraceSummary.intent}
+                            </span>
+                          ) : null}
+                          {agentTraceSummary.effectiveTopK != null ? (
+                            <span>
+                              <span className="font-semibold">Effective top K:</span> {agentTraceSummary.effectiveTopK}
+                            </span>
+                          ) : null}
+                          {agentTraceSummary.chunkCount != null ? (
+                            <span>
+                              <span className="font-semibold">Chunk count:</span> {agentTraceSummary.chunkCount}
+                            </span>
+                          ) : null}
+                          {agentTraceSummary.insufficient != null ? (
+                            <span>
+                              <span className="font-semibold">Insufficient (recommended):</span>{" "}
+                              {agentTraceSummary.insufficient ? "yes" : "no"}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      <ul className="space-y-1.5">
+                        {(latestDiagnostics.agent_steps as Array<{ step?: string; status?: string; details?: unknown }>).map(
+                          (stepItem, idx) => {
+                            const key = String(stepItem.step ?? idx);
+                            const label = AGENT_STEP_LABELS[key] ?? key;
+                            return (
+                              <li key={`agent-step-${idx}-${key}`} className="rounded border border-emerald-100/90 bg-white/90 p-2">
+                                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                                  <span className="font-semibold text-slate-800">{label}</span>
+                                  <span className="text-[11px] uppercase tracking-wide text-slate-500">{stepItem.status ?? "—"}</span>
+                                </div>
+                                <details className="mt-1">
+                                  <summary className="cursor-pointer text-[11px] text-emerald-900/90">Raw details</summary>
+                                  <pre className="mt-1 max-h-36 overflow-auto rounded bg-slate-50 p-2 text-[10px] leading-snug text-slate-700">
+                                    {JSON.stringify(stepItem.details ?? {}, null, 2)}
+                                  </pre>
+                                </details>
+                              </li>
+                            );
+                          },
+                        )}
+                      </ul>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500">
+                      Agent orchestration trace is not available for this response.
+                    </p>
+                  )}
                 </div>
               </div>
             ) : null}

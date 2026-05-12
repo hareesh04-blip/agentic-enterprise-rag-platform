@@ -1,6 +1,7 @@
 import axios from "axios";
 
-const baseURL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8010/api/v1";
+export const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8010/api/v1";
+const baseURL = apiBaseUrl;
 const TOKEN_KEY = "aerag_token";
 
 export const apiClient = axios.create({
