@@ -8,6 +8,10 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.database import SessionLocal
+from app.services.chunking_service import (
+    generic_chunk_qualifies_as_response_fields,
+    response_parameters_chunk_quality,
+)
 from app.services.embedding_service import embedding_service
 from app.services.query_intent_service import detect_query_intents
 from app.services.qdrant_client import qdrant_service
@@ -20,6 +24,8 @@ class EmbeddingUnavailableError(RuntimeError):
 
 
 class RetrievalService:
+    _last_parameter_promotion_applied: bool = False
+
     async def retrieve(
         self,
         project_id: int,
@@ -27,6 +33,7 @@ class RetrievalService:
         question: str,
         top_k: int = 5,
     ) -> dict[str, Any]:
+        self._last_parameter_promotion_applied = False
         candidate_k = max(settings.HYBRID_VECTOR_TOP_K, top_k * 3, 12)
         collection_name = qdrant_service._active_collection_name()
         collection_exists_flag = qdrant_service.collection_exists()
@@ -73,6 +80,7 @@ class RetrievalService:
             "vector_hits_missing_db_row_filtered": 0,
             "vector_hits_project_mismatch_filtered": 0,
             "vector_hits_kb_mismatch_filtered": 0,
+            "vector_hits_inactive_document_filtered": 0,
             "embedding_model": active_embedding_model,
             "embedding_endpoint": f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/embeddings",
             "embedding_text_length": len(question or ""),
@@ -248,6 +256,9 @@ class RetrievalService:
                         d.source_domain,
                         d.product_name,
                         d.document_version,
+                        d.uploaded_at,
+                        d.ingestion_run_id,
+                        d.is_active_document,
                         kb.name AS knowledge_base_name,
                         e.id AS endpoint_id,
                         e.api_reference_id,
@@ -268,7 +279,7 @@ class RetrievalService:
                 rows_by_point[str(row["qdrant_point_id"])] = dict(row)
 
         vector_candidates: list[dict[str, Any]] = []
-        missing_db = project_mismatch = kb_mismatch = 0
+        missing_db = project_mismatch = kb_mismatch = inactive_filtered = 0
 
         for hit in hits:
             point_id = str(hit.id)
@@ -281,6 +292,9 @@ class RetrievalService:
                 continue
             if row.get("knowledge_base_id") != knowledge_base_id:
                 kb_mismatch += 1
+                continue
+            if row.get("is_active_document") is False:
+                inactive_filtered += 1
                 continue
             payload = hit.payload or {}
             metadata = payload.get("metadata") or {}
@@ -313,8 +327,16 @@ class RetrievalService:
                     "document_version": document_version_val,
                     "knowledge_base_id": kb_id_val,
                     "knowledge_base_name": row.get("knowledge_base_name"),
+                    "upload_timestamp": row.get("uploaded_at").isoformat()
+                    if row.get("uploaded_at") is not None and hasattr(row.get("uploaded_at"), "isoformat")
+                    else None,
+                    "ingestion_run_id": row.get("ingestion_run_id"),
+                    "is_active_document": row.get("is_active_document")
+                    if row.get("is_active_document") is not None
+                    else True,
                 }
             )
+        vector_diag_base["vector_hits_inactive_document_filtered"] = inactive_filtered
         vector_diag_base["vector_candidate_count"] = len(vector_candidates)
 
         detected_intents = detect_query_intents(question)
@@ -356,12 +378,20 @@ class RetrievalService:
                 )
             else:
                 combined_candidates = sorted(combined_candidates, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+            combined_candidates = self._promote_matching_request_parameter_chunks(
+                combined_candidates,
+                question,
+                detected_intents,
+            )
         except Exception as exc:
             logger.warning("hybrid_rerank_failed project=%s kb=%s err=%s", project_id, knowledge_base_id, exc)
             retrieval_mode = "vector_only"
             combined_candidates = sorted(vector_candidates, key=lambda x: float(x.get("score") or 0.0), reverse=True)
             vector_diag_base["hybrid_fusion_used"] = False
             vector_diag_base["fusion_candidate_count"] = 0
+
+        vector_diag_base["request_parameter_chunk_promoted"] = self._last_parameter_promotion_applied
 
         metadata_boost_applied = any((item.get("_metadata_boost", 0.0) or 0.0) > 0 for item in combined_candidates)
         top_combined_score = combined_candidates[0].get("_combined_score") if combined_candidates else None
@@ -483,6 +513,48 @@ class RetrievalService:
         ]
         return "|".join(parts)
 
+    def _promote_matching_request_parameter_chunks(
+        self,
+        candidates: list[dict[str, Any]],
+        question: str,
+        intents: list[str],
+    ) -> list[dict[str, Any]]:
+        """
+        Move the best-matching api_request_parameters_chunk to rank 1 when the question asks for
+        mandatory/required/request inputs for a named API (hybrid pool may still rank metadata higher).
+        """
+        self._last_parameter_promotion_applied = False
+        if "parameter_intent" not in intents or not candidates:
+            return candidates
+        q = (question or "").lower()
+        best_idx: int | None = None
+        best_score = -1.0
+        for idx, item in enumerate(candidates):
+            if (item.get("chunk_type") or "") != "api_request_parameters_chunk":
+                continue
+            sn = (item.get("service_name") or "").lower()
+            ar = (item.get("api_reference_id") or "").lower()
+            txt = (item.get("chunk_text") or "").lower()
+            score = 0.0
+            if sn and sn in q:
+                score += 5.0
+            if ar and ar in q:
+                score += 4.0
+            for tok in self._tokenize(question):
+                if len(tok) >= 6 and tok in txt:
+                    score += 0.35
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx is None or best_score < 2.0:
+            return candidates
+        if best_idx == 0:
+            return candidates
+        promoted = candidates[best_idx]
+        others = [c for i, c in enumerate(candidates) if i != best_idx]
+        self._last_parameter_promotion_applied = True
+        return [promoted] + others
+
     def _rerank_candidates(self, *, candidates: list[dict[str, Any]], question: str, intents: list[str]) -> list[dict[str, Any]]:
         if not candidates:
             return []
@@ -545,19 +617,78 @@ class RetrievalService:
 
         if "authentication_intent" in intents:
             if chunk_type == "authentication_chunk":
-                chunk_type_boost += 0.35
+                # Step 55: expiry-specific questions should rank auth_semantic_summary_chunk above thin preamble chunks.
+                auth_boost = 0.22 if "token_expiry_intent" in intents else 0.75
+                chunk_type_boost += auth_boost
                 labels.append("authentication_chunk")
+            if chunk_type == "auth_semantic_summary_chunk":
+                chunk_type_boost += 0.35
+                labels.append("auth_semantic_summary_chunk")
             if any(token in text for token in ["token", "oauth2", "client credentials", "jwt", "getsso", "bearer"]):
                 metadata_boost += 0.25
                 labels.append("auth_tokens")
 
         if "error_intent" in intents:
-            if chunk_type == "api_sample_failed_response_chunk":
+            if chunk_type in {"api_sample_failed_response_chunk", "api_error_codes_chunk"}:
                 chunk_type_boost += 0.35
                 labels.append("failed_response_chunk")
             if any(token in text for token in ["failed response", "returncode", "returnmsg", "incorrect", "invalid"]):
                 metadata_boost += 0.25
                 labels.append("error_tokens")
+
+        if "response_field_intent" in intents:
+            if chunk_type == "endpoint_response_chunk":
+                chunk_type_boost += 0.55
+                labels.append("response_field_chunk_type")
+            if chunk_type == "api_sample_success_response_chunk":
+                chunk_type_boost += 0.48
+                labels.append("response_field_chunk_type")
+                tail = ""
+                if "sample success response:" in text:
+                    tail = text.split("sample success response:", 1)[-1].strip()[:240]
+                if not tail or tail.lower().startswith("n/a") or tail.lower() == "n/a":
+                    chunk_type_boost -= 0.78
+                    labels.append("empty_sample_success_penalty")
+            if chunk_type == "api_sample_failed_response_chunk":
+                chunk_type_boost += 0.35
+                ftail = ""
+                if "sample failed response:" in text:
+                    ftail = text.split("sample failed response:", 1)[-1].strip()[:240]
+                elif "failed response:" in text:
+                    ftail = text.split("failed response:", 1)[-1].strip()[:240]
+                if not ftail or ftail.lower().startswith("n/a") or ftail.lower() == "n/a":
+                    chunk_type_boost -= 0.78
+                    labels.append("empty_sample_failed_penalty")
+            if chunk_type == "api_response_parameters_chunk":
+                q = response_parameters_chunk_quality(str(item.get("chunk_text") or ""))
+                if q.get("boost_ok"):
+                    chunk_type_boost += 0.62
+                    labels.append("structured_response_boost")
+                else:
+                    chunk_type_boost -= 0.82
+                    labels.append("weak_response_chunk_penalty")
+            if chunk_type == "generic_section_chunk":
+                if generic_chunk_qualifies_as_response_fields(str(item.get("chunk_text") or "")):
+                    chunk_type_boost += 0.62
+                    labels.append("generic_response_fields_boost")
+                else:
+                    chunk_type_boost -= 0.15
+                    labels.append("response_intent_generic_penalty")
+            if chunk_type == "api_semantic_summary_chunk":
+                if any(
+                    k in text
+                    for k in (
+                        "success response fields",
+                        "responseinfo",
+                        "qrtext",
+                        "transactionid",
+                        "correlationid",
+                        "errorcode",
+                        "errormsg",
+                    )
+                ):
+                    chunk_type_boost += 0.40
+                    labels.append("api_semantic_summary_response_fields")
 
         if "async_intent" in intents:
             if chunk_type in {"api_metadata_chunk", "api_overview_chunk"}:
@@ -580,9 +711,65 @@ class RetrievalService:
                 labels.append("service_and_ref")
 
         if "parameter_intent" in intents:
-            if chunk_type in {"api_request_parameters_chunk", "api_response_parameters_chunk"}:
+            if chunk_type in {
+                "api_request_parameters_chunk",
+                "api_response_parameters_chunk",
+                "api_header_parameters_chunk",
+                "api_query_parameters_chunk",
+                "api_jwt_payload_chunk",
+                "api_semantic_summary_chunk",
+                "api_table_flattened_chunk",
+            }:
+                boost = 0.32
+                if chunk_type == "api_request_parameters_chunk":
+                    boost = 0.55
+                    qlow = (question or "").lower()
+                    sn = (item.get("service_name") or "").lower()
+                    ar = (item.get("api_reference_id") or "").lower()
+                    if sn and sn in qlow:
+                        boost += 0.95
+                        labels.append("request_param_service_name_match")
+                    if ar and ar in qlow:
+                        boost += 0.75
+                        labels.append("request_param_api_ref_match")
+                    ctx = (item.get("chunk_text") or "").lower()
+                    if "request parameters" in ctx and any(
+                        w in ctx for w in ("mandatory", "required", "name", "type", "description")
+                    ):
+                        boost += 0.2
+                        labels.append("request_param_table_signal")
+                chunk_type_boost += boost
+                labels.append("parameter_chunk_type")
+            if "response_field_intent" not in intents and chunk_type == "api_error_codes_chunk":
                 chunk_type_boost += 0.30
                 labels.append("parameter_chunk_type")
+
+        if "header_parameter_intent" in intents:
+            if chunk_type in {"api_semantic_summary_chunk", "api_table_flattened_chunk", "api_header_parameters_chunk"}:
+                if any(k in text for k in ["header", "authorization", "transactionid", "required header"]):
+                    chunk_type_boost += 1.18
+                    labels.append("header_semantic_boost")
+
+        if "token_expiry_intent" in intents:
+            if chunk_type == "auth_semantic_summary_chunk":
+                if any(k in text for k in ["540", "60", "expires", "expiry", "expire", "prod", "token", "non-prod", "nonprod"]):
+                    chunk_type_boost += 1.25
+                    labels.append("token_expiry_semantic_boost")
+            elif chunk_type == "authentication_chunk":
+                if any(k in text for k in ["540", "60", "expires", "expiry", "expire", "prod", "token", "non-prod", "nonprod"]):
+                    chunk_type_boost += 0.45
+                    labels.append("token_expiry_authentication_chunk")
+
+        if "request_structure_intent" in intents:
+            if chunk_type in {
+                "api_semantic_summary_chunk",
+                "api_table_flattened_chunk",
+                "api_sample_request_chunk",
+                "api_query_parameters_chunk",
+                "api_request_parameters_chunk",
+            }:
+                chunk_type_boost += 0.44
+                labels.append("request_structure_boost")
 
         if "overview_intent" in intents:
             if chunk_type in {"document_overview_chunk", "generic_section_chunk"}:
@@ -599,7 +786,7 @@ class RetrievalService:
             labels.append("legacy_chunk_penalty")
 
         metadata_boost = max(min(metadata_boost, 1.5), -0.2)
-        chunk_type_boost = max(min(chunk_type_boost, 1.2), -0.4)
+        chunk_type_boost = max(min(chunk_type_boost, 1.2), -1.15)
         return metadata_boost, chunk_type_boost, labels
 
     def _metadata_coverage_ratio(self, candidates: list[dict[str, Any]]) -> float:
@@ -639,11 +826,15 @@ class RetrievalService:
                     SELECT
                         dc.chunk_text,
                         dc.chunk_type,
+                        d.id AS document_id,
                         d.file_name,
                         d.document_type,
                         d.source_domain,
                         d.product_name,
                         d.document_version,
+                        d.uploaded_at,
+                        d.ingestion_run_id,
+                        d.is_active_document,
                         d.knowledge_base_id,
                         kb.name AS knowledge_base_name,
                         e.api_reference_id,
@@ -658,6 +849,7 @@ class RetrievalService:
                     LEFT JOIN api_endpoints e ON e.id = dc.endpoint_id
                     WHERE d.project_id = :project_id
                       AND d.knowledge_base_id = :knowledge_base_id
+                      AND (d.is_active_document IS NULL OR d.is_active_document IS TRUE)
                       AND (
                         LOWER(COALESCE(dc.chunk_text, '')) LIKE ANY(:like_terms)
                         OR LOWER(COALESCE(e.api_reference_id, '')) LIKE ANY(:like_terms)
@@ -701,6 +893,14 @@ class RetrievalService:
                     "chunk_text": row_dict.get("chunk_text"),
                     "knowledge_base_id": row_dict.get("knowledge_base_id"),
                     "knowledge_base_name": row_dict.get("knowledge_base_name"),
+                    "document_id": row_dict.get("document_id"),
+                    "upload_timestamp": row_dict.get("uploaded_at").isoformat()
+                    if row_dict.get("uploaded_at") is not None and hasattr(row_dict.get("uploaded_at"), "isoformat")
+                    else None,
+                    "ingestion_run_id": row_dict.get("ingestion_run_id"),
+                    "is_active_document": row_dict.get("is_active_document")
+                    if row_dict.get("is_active_document") is not None
+                    else True,
                 }
             )
 
@@ -744,6 +944,19 @@ class RetrievalService:
                 score += 1.5
         if chunk_type in {"endpoint_summary_chunk", "api_metadata_chunk", "api_overview_chunk"}:
             score += 1.0
+        param_hint_terms = {
+            "mandatory",
+            "required",
+            "request",
+            "parameter",
+            "parameters",
+            "input",
+            "payload",
+            "body",
+            "fields",
+        }
+        if chunk_type == "api_request_parameters_chunk" and param_hint_terms.intersection(set(terms)):
+            score += 2.8
         return score
 
 

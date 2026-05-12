@@ -58,8 +58,8 @@ async def embed_docx_chunks_preview(file: UploadFile = File(...)) -> dict:
                     "chunk_type": item.get("chunk_type"),
                     "api_reference_id": (item.get("metadata") or {}).get("api_reference_id"),
                     "service_name": (item.get("metadata") or {}).get("service_name"),
-                    "embedding_dimension": len(item.get("embedding", [])),
-                    "first_5_values": item.get("embedding", [])[:5],
+                    "embedding_dimension": len(item.get("embedding") or []),
+                    "first_5_values": (item.get("embedding") or [])[:5],
                 }
                 for item in embedded
             ],

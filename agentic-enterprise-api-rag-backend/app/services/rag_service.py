@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import Counter
+from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 from sqlalchemy import text
 
 from app.prompts.rag_answer_prompt import build_rag_prompt, detect_prompt_mode
@@ -17,9 +20,63 @@ from app.services.retrieval_service import retrieval_service
 from app.services.suggested_question_service import suggested_question_service
 from app.services.confidence_service import confidence_service
 from app.services.impact_analysis_service import impact_analysis_service
+from app.services.conversation_summary_service import conversation_summary_service
+from app.services.chunking_service import (
+    generic_chunk_qualifies_as_response_fields,
+    response_parameters_chunk_quality,
+)
 
 logger = logging.getLogger(__name__)
 INSUFFICIENT_CONTEXT_ANSWER = "I could not find enough information in the selected knowledge base to answer this confidently."
+PROVIDER_GENERATION_FAILURE_ANSWER = (
+    "The answer could not be generated right now. Please try again."
+)
+
+MIN_MEANINGFUL_GENERATION_CHARS = 12
+MIN_PROMPT_CONTEXT_CHARS_SUBSTANTIVE = 120
+
+
+def _answer_is_meaningful(text: str | None) -> bool:
+    return len((text or "").strip()) >= MIN_MEANINGFUL_GENERATION_CHARS
+
+
+def _is_retryable_provider_error(exc: BaseException) -> bool:
+    """Transient failures eligible for one retry at the RAG layer."""
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 403):
+            return False
+        if code in (408, 429, 500, 502, 503, 504):
+            return True
+        return False
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if "api_key" in msg or "not set" in msg or "openai_api_key" in msg:
+            return False
+        return True
+    return False
+
+
+def _sample_success_tail_usable(chunk_text: str) -> bool:
+    low = (chunk_text or "").lower()
+    if "sample success response:" not in low:
+        return False
+    tail = low.split("sample success response:", 1)[-1].strip()[:240]
+    return bool(tail) and not tail.startswith("n/a")
+
+
+def _sample_failed_tail_usable(chunk_text: str) -> bool:
+    low = (chunk_text or "").lower()
+    tail = ""
+    if "sample failed response:" in low:
+        tail = low.split("sample failed response:", 1)[-1].strip()[:240]
+    elif "failed response:" in low:
+        tail = low.split("failed response:", 1)[-1].strip()[:240]
+    return bool(tail) and not tail.startswith("n/a")
 DEFAULT_IMPACT_ANALYSIS = {
     "primary_entities": [],
     "related_entities": [],
@@ -39,13 +96,17 @@ class RagService:
         session_id: int | None = None,
         user_id: int | None = None,
         debug: bool = False,
+        prefetched_retrieval: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        retrieval_data = await retrieval_service.retrieve(
-            project_id=project_id,
-            knowledge_base_id=knowledge_base_id,
-            question=question,
-            top_k=top_k,
-        )
+        if prefetched_retrieval is not None:
+            retrieval_data = prefetched_retrieval
+        else:
+            retrieval_data = await retrieval_service.retrieve(
+                project_id=project_id,
+                knowledge_base_id=knowledge_base_id,
+                question=question,
+                top_k=top_k,
+            )
         results = retrieval_data.get("results", []) or []
         retrieval_mode = retrieval_data.get("retrieval_mode", "vector")
         detected_intents = detect_query_intents(question)
@@ -61,6 +122,8 @@ class RagService:
             question=question,
             user_id=user_id,
         )
+        conv_mem = self._load_conversation_memory(current_session_id, knowledge_base_id)
+        summary_injected = False
 
         if not results:
             answer = INSUFFICIENT_CONTEXT_ANSWER
@@ -104,12 +167,15 @@ class RagService:
                 knowledge_base_id=knowledge_base_id,
                 diagnostics=diagnostics,
             )
+            if debug:
+                self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
             self._persist_messages(
                 session_id=current_session_id,
                 question=question,
                 answer=answer,
                 sources=sources,
             )
+            await self._after_turn_persisted(current_session_id)
             return {
                 "session_id": current_session_id,
                 "project_id": project_id,
@@ -179,12 +245,15 @@ class RagService:
                     impact_analysis=impact_analysis,
                     status=impact_analysis_status,
                 )
+            if debug:
+                self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
             self._persist_messages(
                 session_id=current_session_id,
                 question=question,
                 answer=answer,
                 sources=sources,
             )
+            await self._after_turn_persisted(current_session_id)
             return {
                 "session_id": current_session_id,
                 "project_id": project_id,
@@ -252,12 +321,15 @@ class RagService:
                     impact_analysis=impact_analysis,
                     status=impact_analysis_status,
                 )
+            if debug:
+                self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
             self._persist_messages(
                 session_id=current_session_id,
                 question=question,
                 answer=async_db_answer,
                 sources=sources,
             )
+            await self._after_turn_persisted(current_session_id)
             return {
                 "session_id": current_session_id,
                 "project_id": project_id,
@@ -326,12 +398,15 @@ class RagService:
                     impact_analysis=impact_analysis,
                     status=impact_analysis_status,
                 )
+            if debug:
+                self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
             self._persist_messages(
                 session_id=current_session_id,
                 question=question,
                 answer=error_lookup_answer,
                 sources=sources,
             )
+            await self._after_turn_persisted(current_session_id)
             return {
                 "session_id": current_session_id,
                 "project_id": project_id,
@@ -347,8 +422,21 @@ class RagService:
                 **({"diagnostics": diagnostics} if debug else {}),
             }
 
-        prompt_contexts, prompt_context_diag = self._select_prompt_contexts(results=results, top_k=top_k)
-        context_is_insufficient = self._is_context_insufficient(question=question, contexts=prompt_contexts or results)
+        prompt_contexts, prompt_context_diag = self._select_prompt_contexts(
+            results=results, top_k=top_k, detected_intents=detected_intents, question=question
+        )
+        prompt_contexts, recovered_generic = self._annotate_recovered_response_chunks(
+            prompt_contexts or [], detected_intents
+        )
+        prompt_context_diag = {
+            **prompt_context_diag,
+            "response_fields_recovered_from_generic": recovered_generic,
+        }
+        context_is_insufficient = self._is_context_insufficient(
+            question=question,
+            contexts=prompt_contexts or results,
+            detected_intents=detected_intents,
+        )
         if context_is_insufficient and self._has_intent_supporting_context(detected_intents, prompt_contexts or results):
             context_is_insufficient = False
         if context_is_insufficient:
@@ -394,12 +482,15 @@ class RagService:
                 knowledge_base_id=knowledge_base_id,
                 diagnostics=diagnostics,
             )
+            if debug:
+                self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
             self._persist_messages(
                 session_id=current_session_id,
                 question=question,
                 answer=answer,
                 sources=sources,
             )
+            await self._after_turn_persisted(current_session_id)
             return {
                 "session_id": current_session_id,
                 "project_id": project_id,
@@ -416,31 +507,31 @@ class RagService:
             }
 
         prompt_mode = detect_prompt_mode(prompt_contexts or results)
+        session_summary_text = (conv_mem.get("summary_text") or "").strip() or None
+        summary_injected = bool(session_summary_text)
+        rf_instruction = self._response_field_prompt_instruction(detected_intents)
         prompt = build_rag_prompt(
             question=question,
             contexts=prompt_contexts or results,
             prompt_mode=prompt_mode,
+            session_summary=session_summary_text,
+            response_field_instruction=rf_instruction,
         )
-        answer: str | None = None
-        llm_status = "fallback_no_llm"
         llm_provider = (settings.LLM_PROVIDER or "ollama").strip().lower()
-        try:
-            if llm_provider == "openai":
-                answer = await openai_client.generate(prompt, model=settings.OPENAI_LLM_MODEL)
-                if answer:
-                    llm_status = "generated"
-            else:
-                llm_response = await ollama_client.generate_test(prompt)
-                answer = (llm_response.get("response") or "").strip()
-                if answer:
-                    llm_status = "generated"
-        except Exception:
-            llm_status = "generation_retry_failed"
-            answer = None
-
-        if not answer:
-            answer = INSUFFICIENT_CONTEXT_ANSWER
-            llm_status = "fallback_insufficient_context"
+        answer, gen_diag = await self._generate_with_provider_retry(prompt, llm_provider)
+        if answer and _answer_is_meaningful(answer):
+            llm_status = "generated"
+        else:
+            answer, llm_status = self._resolve_llm_failure_answer(results=results, prompt_context_diag=prompt_context_diag)
+        logger.info(
+            "llm_generation_complete kb=%s llm_status=%s gen_chars=%s retry=%s empty=%s exc=%s",
+            knowledge_base_id,
+            llm_status,
+            gen_diag.get("generation_char_count"),
+            gen_diag.get("provider_retry_attempted"),
+            gen_diag.get("provider_response_empty"),
+            gen_diag.get("provider_exception_type"),
+        )
 
         sources = [self._to_source_item(item) for item in results]
         suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
@@ -458,6 +549,7 @@ class RagService:
             retrieval_message=retrieval_notice,
             prompt_context_diagnostics=prompt_context_diag,
         )
+        self._merge_generation_diagnostics(diagnostics, gen_diag)
         if debug:
             self._add_suggested_question_diagnostics(
                 diagnostics=diagnostics,
@@ -495,12 +587,15 @@ class RagService:
             knowledge_base_id=knowledge_base_id,
             diagnostics=diagnostics,
         )
+        if debug:
+            self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
         self._persist_messages(
             session_id=current_session_id,
             question=question,
             answer=answer,
             sources=sources,
         )
+        await self._after_turn_persisted(current_session_id)
 
         return {
             "session_id": current_session_id,
@@ -517,6 +612,687 @@ class RagService:
             **({"diagnostics": diagnostics} if debug else {}),
         }
 
+    async def answer_question_stream(
+        self,
+        project_id: int,
+        knowledge_base_id: int,
+        question: str,
+        top_k: int = 5,
+        session_id: int | None = None,
+        user_id: int | None = None,
+        debug: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Same logic as answer_question but emits SSE-style events; persists user message first, assistant after stream."""
+
+        async def emit_tokens_for_text(text: str):
+            async for piece in self._simulate_stream(text):
+                yield {"event": "token", "data": {"text": piece}}
+
+        try:
+            retrieval_data = await retrieval_service.retrieve(
+                project_id=project_id,
+                knowledge_base_id=knowledge_base_id,
+                question=question,
+                top_k=top_k,
+            )
+            results = retrieval_data.get("results", []) or []
+            retrieval_mode = retrieval_data.get("retrieval_mode", "vector")
+            detected_intents = detect_query_intents(question)
+            vector_diag_for_debug = retrieval_data.get("vector_retrieval_diagnostics") if debug else None
+            retrieval_notice = retrieval_data.get("message") if debug else None
+            current_session_id = self._ensure_session(
+                session_id=session_id,
+                knowledge_base_id=knowledge_base_id,
+                question=question,
+                user_id=user_id,
+            )
+            conv_mem = self._load_conversation_memory(current_session_id, knowledge_base_id)
+            summary_injected = False
+            self._persist_user_message(session_id=current_session_id, question=question)
+        except ValueError as exc:
+            yield {"event": "error", "data": {"detail": str(exc)}}
+            return
+
+        yield {
+            "event": "start",
+            "data": {
+                "session_id": current_session_id,
+                "project_id": project_id,
+                "knowledge_base_id": knowledge_base_id,
+                "question": question.strip(),
+            },
+        }
+
+        try:
+            if not results:
+                answer = INSUFFICIENT_CONTEXT_ANSWER
+                sources: list[dict[str, Any]] = []
+                suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
+                    user_question=question,
+                    answer=answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                    llm_status="fallback_insufficient_context",
+                )
+                diagnostics = self._build_retrieval_diagnostics(
+                    retrieval_mode=retrieval_mode,
+                    knowledge_base_id=knowledge_base_id,
+                    results=results,
+                    vector_observability=vector_diag_for_debug,
+                    retrieval_message=retrieval_notice,
+                )
+                if debug:
+                    self._add_suggested_question_diagnostics(
+                        diagnostics=diagnostics,
+                        suggested_questions=suggested_questions,
+                        generation_mode=sq_mode,
+                        status=sq_status,
+                    )
+                confidence, confidence_status = self._compute_confidence(
+                    answer=answer,
+                    llm_status="fallback_insufficient_context",
+                    results=results,
+                    diagnostics=diagnostics,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_confidence_diagnostics(
+                        diagnostics=diagnostics,
+                        confidence=confidence,
+                        status=confidence_status,
+                    )
+                self._log_retrieval_summary(
+                    question=question,
+                    knowledge_base_id=knowledge_base_id,
+                    diagnostics=diagnostics,
+                )
+                if debug:
+                    self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
+                async for evt in emit_tokens_for_text(answer):
+                    yield evt
+                yield {"event": "sources", "data": {"sources": sources}}
+                if debug:
+                    yield {"event": "diagnostics", "data": {"diagnostics": diagnostics}}
+                done_payload = {
+                    "session_id": current_session_id,
+                    "project_id": project_id,
+                    "knowledge_base_id": knowledge_base_id,
+                    "question": question.strip(),
+                    "answer": answer,
+                    "retrieval_mode": retrieval_mode,
+                    "llm_status": "fallback_insufficient_context",
+                    "sources": sources,
+                    "suggested_questions": suggested_questions,
+                    "confidence": confidence,
+                    "impact_analysis": None,
+                    **({"diagnostics": diagnostics} if debug else {}),
+                }
+                yield {"event": "done", "data": done_payload}
+                self._persist_assistant_message(current_session_id, answer, sources)
+                await self._after_turn_persisted(current_session_id)
+                return
+
+            async_aggregation_answer = self._build_async_aggregation_answer(
+                question=question,
+                results=results,
+                detected_intents=detected_intents,
+            )
+            if async_aggregation_answer:
+                answer = async_aggregation_answer
+                sources = [self._to_source_item(item) for item in results]
+                suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
+                    user_question=question,
+                    answer=answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                    llm_status="generated",
+                )
+                diagnostics = self._build_retrieval_diagnostics(
+                    retrieval_mode=retrieval_mode,
+                    knowledge_base_id=knowledge_base_id,
+                    results=results,
+                    vector_observability=vector_diag_for_debug,
+                    retrieval_message=retrieval_notice,
+                )
+                if debug:
+                    self._add_suggested_question_diagnostics(
+                        diagnostics=diagnostics,
+                        suggested_questions=suggested_questions,
+                        generation_mode=sq_mode,
+                        status=sq_status,
+                    )
+                confidence, confidence_status = self._compute_confidence(
+                    answer=answer,
+                    llm_status="generated",
+                    results=results,
+                    diagnostics=diagnostics,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_confidence_diagnostics(
+                        diagnostics=diagnostics,
+                        confidence=confidence,
+                        status=confidence_status,
+                    )
+                impact_analysis, impact_analysis_status = self._compute_impact_analysis(
+                    question=question,
+                    answer=answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_impact_diagnostics(
+                        diagnostics=diagnostics,
+                        impact_analysis=impact_analysis,
+                        status=impact_analysis_status,
+                    )
+                if debug:
+                    self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
+                async for evt in emit_tokens_for_text(answer):
+                    yield evt
+                yield {"event": "sources", "data": {"sources": sources}}
+                if debug:
+                    yield {"event": "diagnostics", "data": {"diagnostics": diagnostics}}
+                yield {
+                    "event": "done",
+                    "data": {
+                        "session_id": current_session_id,
+                        "project_id": project_id,
+                        "knowledge_base_id": knowledge_base_id,
+                        "question": question.strip(),
+                        "answer": answer,
+                        "retrieval_mode": retrieval_mode,
+                        "llm_status": "generated",
+                        "sources": sources,
+                        "suggested_questions": suggested_questions,
+                        "confidence": confidence,
+                        "impact_analysis": impact_analysis,
+                        **({"diagnostics": diagnostics} if debug else {}),
+                    },
+                }
+                self._persist_assistant_message(current_session_id, answer, sources)
+                await self._after_turn_persisted(current_session_id)
+                return
+
+            async_db_answer = self._build_async_db_answer(
+                knowledge_base_id=knowledge_base_id,
+                detected_intents=detected_intents,
+            )
+            if async_db_answer:
+                sources = [self._to_source_item(item) for item in results]
+                suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
+                    user_question=question,
+                    answer=async_db_answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                    llm_status="generated",
+                )
+                diagnostics = self._build_retrieval_diagnostics(
+                    retrieval_mode=retrieval_mode,
+                    knowledge_base_id=knowledge_base_id,
+                    results=results,
+                    vector_observability=vector_diag_for_debug,
+                    retrieval_message=retrieval_notice,
+                )
+                if debug:
+                    self._add_suggested_question_diagnostics(
+                        diagnostics=diagnostics,
+                        suggested_questions=suggested_questions,
+                        generation_mode=sq_mode,
+                        status=sq_status,
+                    )
+                confidence, confidence_status = self._compute_confidence(
+                    answer=async_db_answer,
+                    llm_status="generated",
+                    results=results,
+                    diagnostics=diagnostics,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_confidence_diagnostics(
+                        diagnostics=diagnostics,
+                        confidence=confidence,
+                        status=confidence_status,
+                    )
+                impact_analysis, impact_analysis_status = self._compute_impact_analysis(
+                    question=question,
+                    answer=async_db_answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_impact_diagnostics(
+                        diagnostics=diagnostics,
+                        impact_analysis=impact_analysis,
+                        status=impact_analysis_status,
+                    )
+                if debug:
+                    self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
+                async for evt in emit_tokens_for_text(async_db_answer):
+                    yield evt
+                yield {"event": "sources", "data": {"sources": sources}}
+                if debug:
+                    yield {"event": "diagnostics", "data": {"diagnostics": diagnostics}}
+                yield {
+                    "event": "done",
+                    "data": {
+                        "session_id": current_session_id,
+                        "project_id": project_id,
+                        "knowledge_base_id": knowledge_base_id,
+                        "question": question.strip(),
+                        "answer": async_db_answer,
+                        "retrieval_mode": retrieval_mode,
+                        "llm_status": "generated",
+                        "sources": sources,
+                        "suggested_questions": suggested_questions,
+                        "confidence": confidence,
+                        "impact_analysis": impact_analysis,
+                        **({"diagnostics": diagnostics} if debug else {}),
+                    },
+                }
+                self._persist_assistant_message(current_session_id, async_db_answer, sources)
+                await self._after_turn_persisted(current_session_id)
+                return
+
+            error_lookup_answer = self._build_error_lookup_answer(
+                question=question,
+                knowledge_base_id=knowledge_base_id,
+                detected_intents=detected_intents,
+            )
+            if error_lookup_answer:
+                sources = [self._to_source_item(item) for item in results]
+                suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
+                    user_question=question,
+                    answer=error_lookup_answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                    llm_status="generated",
+                )
+                diagnostics = self._build_retrieval_diagnostics(
+                    retrieval_mode=retrieval_mode,
+                    knowledge_base_id=knowledge_base_id,
+                    results=results,
+                    vector_observability=vector_diag_for_debug,
+                    retrieval_message=retrieval_notice,
+                )
+                if debug:
+                    self._add_suggested_question_diagnostics(
+                        diagnostics=diagnostics,
+                        suggested_questions=suggested_questions,
+                        generation_mode=sq_mode,
+                        status=sq_status,
+                    )
+                confidence, confidence_status = self._compute_confidence(
+                    answer=error_lookup_answer,
+                    llm_status="generated",
+                    results=results,
+                    diagnostics=diagnostics,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_confidence_diagnostics(
+                        diagnostics=diagnostics,
+                        confidence=confidence,
+                        status=confidence_status,
+                    )
+                impact_analysis, impact_analysis_status = self._compute_impact_analysis(
+                    question=question,
+                    answer=error_lookup_answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_impact_diagnostics(
+                        diagnostics=diagnostics,
+                        impact_analysis=impact_analysis,
+                        status=impact_analysis_status,
+                    )
+                if debug:
+                    self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
+                async for evt in emit_tokens_for_text(error_lookup_answer):
+                    yield evt
+                yield {"event": "sources", "data": {"sources": sources}}
+                if debug:
+                    yield {"event": "diagnostics", "data": {"diagnostics": diagnostics}}
+                yield {
+                    "event": "done",
+                    "data": {
+                        "session_id": current_session_id,
+                        "project_id": project_id,
+                        "knowledge_base_id": knowledge_base_id,
+                        "question": question.strip(),
+                        "answer": error_lookup_answer,
+                        "retrieval_mode": retrieval_mode,
+                        "llm_status": "generated",
+                        "sources": sources,
+                        "suggested_questions": suggested_questions,
+                        "confidence": confidence,
+                        "impact_analysis": impact_analysis,
+                        **({"diagnostics": diagnostics} if debug else {}),
+                    },
+                }
+                self._persist_assistant_message(current_session_id, error_lookup_answer, sources)
+                await self._after_turn_persisted(current_session_id)
+                return
+
+            prompt_contexts, prompt_context_diag = self._select_prompt_contexts(
+                results=results, top_k=top_k, detected_intents=detected_intents, question=question
+            )
+            prompt_contexts, recovered_generic = self._annotate_recovered_response_chunks(
+                prompt_contexts or [], detected_intents
+            )
+            prompt_context_diag = {
+                **prompt_context_diag,
+                "response_fields_recovered_from_generic": recovered_generic,
+            }
+            context_is_insufficient = self._is_context_insufficient(
+                question=question,
+                contexts=prompt_contexts or results,
+                detected_intents=detected_intents,
+            )
+            if context_is_insufficient and self._has_intent_supporting_context(detected_intents, prompt_contexts or results):
+                context_is_insufficient = False
+            if context_is_insufficient:
+                answer = INSUFFICIENT_CONTEXT_ANSWER
+                sources = [self._to_source_item(item) for item in results]
+                suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
+                    user_question=question,
+                    answer=answer,
+                    results=results,
+                    detected_intents=detected_intents,
+                    llm_status="fallback_insufficient_context",
+                )
+                diagnostics = self._build_retrieval_diagnostics(
+                    retrieval_mode=retrieval_mode,
+                    knowledge_base_id=knowledge_base_id,
+                    results=results,
+                    vector_observability=vector_diag_for_debug,
+                    retrieval_message=retrieval_notice,
+                    prompt_context_diagnostics=prompt_context_diag,
+                )
+                if debug:
+                    self._add_suggested_question_diagnostics(
+                        diagnostics=diagnostics,
+                        suggested_questions=suggested_questions,
+                        generation_mode=sq_mode,
+                        status=sq_status,
+                    )
+                confidence, confidence_status = self._compute_confidence(
+                    answer=answer,
+                    llm_status="fallback_insufficient_context",
+                    results=results,
+                    diagnostics=diagnostics,
+                    detected_intents=detected_intents,
+                )
+                if debug:
+                    self._add_confidence_diagnostics(
+                        diagnostics=diagnostics,
+                        confidence=confidence,
+                        status=confidence_status,
+                    )
+                self._log_retrieval_summary(
+                    question=question,
+                    knowledge_base_id=knowledge_base_id,
+                    diagnostics=diagnostics,
+                )
+                if debug:
+                    self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
+                async for evt in emit_tokens_for_text(answer):
+                    yield evt
+                yield {"event": "sources", "data": {"sources": sources}}
+                if debug:
+                    yield {"event": "diagnostics", "data": {"diagnostics": diagnostics}}
+                yield {
+                    "event": "done",
+                    "data": {
+                        "session_id": current_session_id,
+                        "project_id": project_id,
+                        "knowledge_base_id": knowledge_base_id,
+                        "question": question.strip(),
+                        "answer": answer,
+                        "retrieval_mode": retrieval_mode,
+                        "llm_status": "fallback_insufficient_context",
+                        "sources": sources,
+                        "suggested_questions": suggested_questions,
+                        "confidence": confidence,
+                        "impact_analysis": None,
+                        **({"diagnostics": diagnostics} if debug else {}),
+                    },
+                }
+                self._persist_assistant_message(current_session_id, answer, sources)
+                await self._after_turn_persisted(current_session_id)
+                return
+
+            prompt_mode = detect_prompt_mode(prompt_contexts or results)
+            session_summary_text = (conv_mem.get("summary_text") or "").strip() or None
+            summary_injected = bool(session_summary_text)
+            rf_instruction = self._response_field_prompt_instruction(detected_intents)
+            prompt = build_rag_prompt(
+                question=question,
+                contexts=prompt_contexts or results,
+                prompt_mode=prompt_mode,
+                session_summary=session_summary_text,
+                response_field_instruction=rf_instruction,
+            )
+            llm_provider = (settings.LLM_PROVIDER or "ollama").strip().lower()
+            gen_diag: dict[str, Any] = {}
+            stream_collector: list[str] = []
+            stream_exc_name: str | None = None
+            try:
+                if llm_provider == "openai":
+                    async for tok in openai_client.generate_stream(prompt, model=settings.OPENAI_LLM_MODEL):
+                        stream_collector.append(tok)
+                        yield {"event": "token", "data": {"text": tok}}
+                else:
+                    async for tok in ollama_client.generate_stream(prompt):
+                        stream_collector.append(tok)
+                        yield {"event": "token", "data": {"text": tok}}
+            except Exception as stream_exc:
+                stream_exc_name = stream_exc.__class__.__name__
+                logger.warning("LLM streaming failed, falling back to non-streaming generate: %s", stream_exc)
+                stream_collector.clear()
+
+            answer = "".join(stream_collector).strip()
+            if _answer_is_meaningful(answer):
+                llm_status = "generated"
+                gen_diag = {
+                    "provider_retry_attempted": False,
+                    "provider_retry_reason": None,
+                    "provider_response_empty": False,
+                    "provider_exception_type": stream_exc_name,
+                    "generation_char_count": len(answer),
+                    "provider_stream_used": True,
+                }
+            else:
+                answer2, gen_diag = await self._generate_with_provider_retry(prompt, llm_provider)
+                if stream_exc_name:
+                    gen_diag["provider_stream_exception_type"] = stream_exc_name
+                gen_diag["provider_stream_chunks_seen"] = len(stream_collector) > 0
+                if answer2 and _answer_is_meaningful(answer2):
+                    answer = answer2
+                    llm_status = "generated"
+                    async for piece in self._simulate_stream(answer):
+                        yield {"event": "token", "data": {"text": piece}}
+                else:
+                    answer, llm_status = self._resolve_llm_failure_answer(
+                        results=results, prompt_context_diag=prompt_context_diag
+                    )
+                    async for piece in self._simulate_stream(answer):
+                        yield {"event": "token", "data": {"text": piece}}
+
+            logger.info(
+                "llm_generation_stream_complete kb=%s llm_status=%s gen_chars=%s retry=%s empty=%s exc=%s",
+                knowledge_base_id,
+                llm_status,
+                gen_diag.get("generation_char_count"),
+                gen_diag.get("provider_retry_attempted"),
+                gen_diag.get("provider_response_empty"),
+                gen_diag.get("provider_exception_type"),
+            )
+
+            sources = [self._to_source_item(item) for item in results]
+            suggested_questions, sq_mode, sq_status = self._generate_suggested_questions(
+                user_question=question,
+                answer=answer,
+                results=results,
+                detected_intents=detected_intents,
+                llm_status=llm_status,
+            )
+            diagnostics = self._build_retrieval_diagnostics(
+                retrieval_mode=retrieval_mode,
+                knowledge_base_id=knowledge_base_id,
+                results=results,
+                vector_observability=vector_diag_for_debug,
+                retrieval_message=retrieval_notice,
+                prompt_context_diagnostics=prompt_context_diag,
+            )
+            self._merge_generation_diagnostics(diagnostics, gen_diag)
+            if debug:
+                self._add_suggested_question_diagnostics(
+                    diagnostics=diagnostics,
+                    suggested_questions=suggested_questions,
+                    generation_mode=sq_mode,
+                    status=sq_status,
+                )
+            confidence, confidence_status = self._compute_confidence(
+                answer=answer,
+                llm_status=llm_status,
+                results=results,
+                diagnostics=diagnostics,
+                detected_intents=detected_intents,
+            )
+            if debug:
+                self._add_confidence_diagnostics(
+                    diagnostics=diagnostics,
+                    confidence=confidence,
+                    status=confidence_status,
+                )
+            impact_analysis, impact_analysis_status = self._compute_impact_analysis(
+                question=question,
+                answer=answer,
+                results=results,
+                detected_intents=detected_intents,
+            )
+            if debug:
+                self._add_impact_diagnostics(
+                    diagnostics=diagnostics,
+                    impact_analysis=impact_analysis,
+                    status=impact_analysis_status,
+                )
+            self._log_retrieval_summary(
+                question=question,
+                knowledge_base_id=knowledge_base_id,
+                diagnostics=diagnostics,
+            )
+            if debug:
+                self._merge_conversation_summary_diagnostics(diagnostics, conv_mem, summary_injected, debug)
+
+            yield {"event": "sources", "data": {"sources": sources}}
+            if debug:
+                yield {"event": "diagnostics", "data": {"diagnostics": diagnostics}}
+            yield {
+                "event": "done",
+                "data": {
+                    "session_id": current_session_id,
+                    "project_id": project_id,
+                    "knowledge_base_id": knowledge_base_id,
+                    "question": question.strip(),
+                    "answer": answer,
+                    "retrieval_mode": retrieval_mode,
+                    "llm_status": llm_status,
+                    "sources": sources,
+                    "suggested_questions": suggested_questions,
+                    "confidence": confidence,
+                    "impact_analysis": impact_analysis,
+                    **({"diagnostics": diagnostics} if debug else {}),
+                },
+            }
+            self._persist_assistant_message(current_session_id, answer, sources)
+            await self._after_turn_persisted(current_session_id)
+
+        except Exception as exc:
+            logger.exception("answer_question_stream failed")
+            yield {"event": "error", "data": {"detail": str(exc)}}
+
+    async def _single_llm_generate(self, prompt: str, llm_provider: str) -> str:
+        if llm_provider == "openai":
+            return await openai_client.generate(prompt, model=settings.OPENAI_LLM_MODEL)
+        llm_response = await ollama_client.generate_test(prompt)
+        return (llm_response.get("response") or "").strip()
+
+    async def _generate_with_provider_retry(self, prompt: str, llm_provider: str) -> tuple[str | None, dict[str, Any]]:
+        """
+        Up to two completion attempts: retry once on empty/weak output or transient provider errors.
+        Returns (answer text or None, generation diagnostics).
+        """
+        diag: dict[str, Any] = {
+            "provider_retry_attempted": False,
+            "provider_retry_reason": None,
+            "provider_response_empty": False,
+            "provider_exception_type": None,
+            "generation_char_count": 0,
+        }
+        for attempt in (1, 2):
+            try:
+                raw = await self._single_llm_generate(prompt, llm_provider)
+                text = (raw or "").strip()
+                diag["generation_char_count"] = len(text)
+                if _answer_is_meaningful(text):
+                    if attempt == 2:
+                        diag["provider_retry_attempted"] = True
+                    return text, diag
+                diag["provider_response_empty"] = True
+                if attempt == 1:
+                    diag["provider_retry_attempted"] = True
+                    diag["provider_retry_reason"] = "empty_or_weak_response"
+                    continue
+                return None, diag
+            except Exception as exc:
+                diag["provider_exception_type"] = exc.__class__.__name__
+                if attempt == 1 and _is_retryable_provider_error(exc):
+                    diag["provider_retry_attempted"] = True
+                    diag["provider_retry_reason"] = "transient_provider_exception"
+                    continue
+                return None, diag
+        return None, diag
+
+    def _substantive_generation_context(
+        self,
+        results: list[dict[str, Any]],
+        prompt_context_diag: dict[str, Any],
+    ) -> bool:
+        if not results:
+            return False
+        chars = int(prompt_context_diag.get("final_prompt_context_chars") or 0)
+        if chars >= MIN_PROMPT_CONTEXT_CHARS_SUBSTANTIVE:
+            return True
+        n = int(prompt_context_diag.get("selected_prompt_chunk_count") or 0)
+        return n >= 1 and chars >= 48
+
+    def _resolve_llm_failure_answer(
+        self,
+        *,
+        results: list[dict[str, Any]],
+        prompt_context_diag: dict[str, Any],
+    ) -> tuple[str, str]:
+        """
+        After failed generation, distinguish retrieval gap vs provider failure.
+        """
+        if self._substantive_generation_context(results, prompt_context_diag):
+            return PROVIDER_GENERATION_FAILURE_ANSWER, "fallback_provider_generation_failure"
+        return INSUFFICIENT_CONTEXT_ANSWER, "fallback_insufficient_context"
+
+    def _merge_generation_diagnostics(self, diagnostics: dict[str, Any], gen_diag: dict[str, Any]) -> None:
+        for key, val in gen_diag.items():
+            diagnostics[key] = val
+
+    async def _simulate_stream(self, text: str, chunk_size: int = 24) -> AsyncIterator[str]:
+        if not text:
+            return
+        for i in range(0, len(text), chunk_size):
+            yield text[i : i + chunk_size]
+            await asyncio.sleep(0)
+
     def _compute_impact_analysis(
         self,
         *,
@@ -528,6 +1304,8 @@ class RagService:
         if not getattr(settings, "ENABLE_IMPACT_ANALYSIS", True):
             return None, "disabled"
         if (answer or "").strip() == INSUFFICIENT_CONTEXT_ANSWER:
+            return None, "skipped"
+        if (answer or "").strip() == PROVIDER_GENERATION_FAILURE_ANSWER:
             return None, "skipped"
         if not results:
             return None, "skipped"
@@ -620,7 +1398,7 @@ class RagService:
     ) -> tuple[list[str], str, str]:
         if not getattr(settings, "ENABLE_SUGGESTED_QUESTIONS", True):
             return [], "disabled", "skipped"
-        if llm_status == "fallback_insufficient_context":
+        if llm_status in ("fallback_insufficient_context", "fallback_provider_generation_failure"):
             return [], "skipped", "skipped"
         if not results:
             return [], "skipped", "skipped"
@@ -656,21 +1434,162 @@ class RagService:
             return None
         return counts.most_common(1)[0][0]
 
-    def _select_prompt_contexts(self, *, results: list[dict[str, Any]], top_k: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    def _structured_response_support_in_contexts(self, contexts: list[dict[str, Any]]) -> bool:
+        for item in contexts:
+            ct = (item.get("chunk_type") or "").lower()
+            txt = str(item.get("chunk_text") or "")
+            if ct == "api_response_parameters_chunk" and response_parameters_chunk_quality(txt).get("boost_ok"):
+                return True
+            if ct == "api_sample_success_response_chunk" and _sample_success_tail_usable(txt):
+                return True
+            if ct == "api_sample_failed_response_chunk" and _sample_failed_tail_usable(txt):
+                return True
+            if ct == "endpoint_response_chunk" and txt.strip():
+                return True
+        return False
+
+    def _annotate_recovered_response_chunks(
+        self,
+        contexts: list[dict[str, Any]],
+        detected_intents: list[str] | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        intents_set = {str(i).strip().lower() for i in (detected_intents or []) if str(i).strip()}
+        if "response_field_intent" not in intents_set:
+            return contexts, False
+        has_structured = self._structured_response_support_in_contexts(contexts)
+        prefix = "Recovered Response Parameters\n"
+        out: list[dict[str, Any]] = []
+        for item in contexts:
+            row = dict(item)
+            ct = (row.get("chunk_type") or "").lower()
+            raw_text = str(row.get("chunk_text") or "")
+            if ct == "generic_section_chunk" and generic_chunk_qualifies_as_response_fields(raw_text):
+                low_head = raw_text.lower().strip()
+                if not low_head.startswith("recovered response parameters"):
+                    row["chunk_text"] = prefix + raw_text
+            out.append(row)
+        any_qualifying_generic = any(
+            (x.get("chunk_type") or "").lower() == "generic_section_chunk"
+            and generic_chunk_qualifies_as_response_fields(str(x.get("chunk_text") or ""))
+            for x in out
+        )
+        recovered_flag = bool(any_qualifying_generic and not has_structured)
+        return out, recovered_flag
+
+    def _response_field_prompt_instruction(self, detected_intents: list[str] | None) -> str | None:
+        intents_set = {str(i).strip().lower() for i in (detected_intents or []) if str(i).strip()}
+        if "response_field_intent" not in intents_set:
+            return None
+        return (
+            "When listing API response fields, include only these fields if they appear in the context: "
+            "status, code, desc, timestamp, transactionId, correlationId, responseInfo, qrText, errorcode, errormsg. "
+            "Do not invent fields that are not present in the context."
+        )
+
+    def _select_prompt_contexts(
+        self,
+        *,
+        results: list[dict[str, Any]],
+        top_k: int,
+        detected_intents: list[str] | None = None,
+        question: str = "",
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not results:
             return [], {
                 "selected_prompt_chunk_count": 0,
                 "dedup_chunks_removed": 0,
                 "diversity_caps_applied": 0,
                 "final_prompt_context_chars": 0,
+                "parameter_prompt_prioritization": False,
+                "max_per_document_cap": None,
+                "max_per_api_ref_cap": None,
+                "max_prompt_chunks_cap": None,
             }
 
-        max_prompt_chunks = max(3, min(top_k, 6))
+        intents_set = {str(i).strip().lower() for i in (detected_intents or []) if str(i).strip()}
+        response_field_intent = "response_field_intent" in intents_set
+        parameter_intent = "parameter_intent" in intents_set
+
+        def _response_chunk_rank(item: dict[str, Any]) -> tuple[int, float]:
+            ct = (item.get("chunk_type") or "").lower()
+            txt = str(item.get("chunk_text") or "")
+            score = float(item.get("score") or item.get("vector_score_raw") or 0.0)
+            if ct == "api_response_parameters_chunk":
+                if response_parameters_chunk_quality(txt).get("boost_ok"):
+                    return (0, score)
+                return (10, score)
+            if ct == "endpoint_response_chunk":
+                return (1, score)
+            if ct == "api_sample_success_response_chunk":
+                if _sample_success_tail_usable(txt):
+                    return (2, score)
+                return (11, score)
+            if ct == "generic_section_chunk":
+                if generic_chunk_qualifies_as_response_fields(txt):
+                    return (3, score)
+                return (14, score)
+            if ct == "api_sample_failed_response_chunk":
+                if _sample_failed_tail_usable(txt):
+                    return (4, score)
+                return (12, score)
+            return (20, score)
+
+        def _chunk_supports_response_fields_prompt(item: dict[str, Any]) -> bool:
+            ct = (item.get("chunk_type") or "").lower()
+            txt = str(item.get("chunk_text") or "")
+            if ct == "api_response_parameters_chunk":
+                return bool(response_parameters_chunk_quality(txt).get("boost_ok"))
+            if ct == "endpoint_response_chunk":
+                return bool(txt.strip())
+            if ct == "api_sample_success_response_chunk":
+                return _sample_success_tail_usable(txt)
+            if ct == "api_sample_failed_response_chunk":
+                return _sample_failed_tail_usable(txt)
+            if ct == "generic_section_chunk":
+                return generic_chunk_qualifies_as_response_fields(txt)
+            return False
+
+        def _parameter_prompt_rank(item: dict[str, Any]) -> tuple[int, float]:
+            ct = (item.get("chunk_type") or "").lower()
+            raw_score = float(item.get("score") or item.get("vector_score_raw") or 0.0)
+            q_low = (question or "").lower()
+            sn = (item.get("service_name") or "").lower()
+            ar = (item.get("api_reference_id") or "").lower()
+            priority = 40
+            if ct == "api_request_parameters_chunk":
+                priority = 0
+                if sn and sn in q_low:
+                    priority = -6
+                elif ar and ar in q_low:
+                    priority = -4
+            elif ct in {"api_query_parameters_chunk", "api_header_parameters_chunk"}:
+                priority = 2
+            elif ct == "api_metadata_chunk":
+                priority = 14
+            elif ct == "document_overview_chunk":
+                priority = 22
+            elif ct == "api_semantic_summary_chunk":
+                priority = 12
+            return (priority, -raw_score)
+
+        ordered_results = list(results)
+        if response_field_intent:
+            ordered_results.sort(key=_response_chunk_rank)
+        elif parameter_intent:
+            ordered_results.sort(key=_parameter_prompt_rank)
+
+        max_prompt_chunks = (
+            max(3, min(top_k, 8)) if parameter_intent else max(3, min(top_k, 6))
+        )
         char_budget = 9000
         max_chunk_chars = 3200
-        max_per_document = 2
+        max_per_document = (
+            3 if response_field_intent else (10 if parameter_intent else 2)
+        )
         max_per_section = 1
-        max_per_api_ref = 2
+        max_per_api_ref = (
+            4 if response_field_intent else (12 if parameter_intent else 2)
+        )
 
         selected: list[dict[str, Any]] = []
         selected_token_sets: list[set[str]] = []
@@ -682,7 +1601,7 @@ class RagService:
         diversity_caps_applied = 0
         total_chars = 0
 
-        for item in results:
+        for item in ordered_results:
             if len(selected) >= max_prompt_chunks:
                 break
 
@@ -696,7 +1615,13 @@ class RagService:
                 continue
 
             candidate_tokens = self._token_set(chunk_text)
-            if any(self._token_overlap_ratio(candidate_tokens, existing) >= 0.88 for existing in selected_token_sets):
+            chunk_type_l = (item.get("chunk_type") or "").lower()
+            skip_overlap_check = response_field_intent and _chunk_supports_response_fields_prompt(item)
+            if parameter_intent and chunk_type_l == "api_request_parameters_chunk":
+                skip_overlap_check = True
+            if not skip_overlap_check and any(
+                self._token_overlap_ratio(candidate_tokens, existing) >= 0.88 for existing in selected_token_sets
+            ):
                 dedup_removed += 1
                 continue
 
@@ -708,8 +1633,9 @@ class RagService:
                 diversity_caps_applied += 1
                 continue
             if section_key != "no_section" and per_section.get(section_key, 0) >= max_per_section:
-                diversity_caps_applied += 1
-                continue
+                if not (response_field_intent and _chunk_supports_response_fields_prompt(item)):
+                    diversity_caps_applied += 1
+                    continue
             if api_ref_key != "no_api_ref" and per_api_ref.get(api_ref_key, 0) >= max_per_api_ref:
                 diversity_caps_applied += 1
                 continue
@@ -737,7 +1663,7 @@ class RagService:
             total_chars += chunk_len
 
         if not selected:
-            selected = results[: min(len(results), max_prompt_chunks)]
+            selected = ordered_results[: min(len(ordered_results), max_prompt_chunks)]
             total_chars = sum(len((x.get("chunk_text") or "").strip()) for x in selected)
 
         return selected, {
@@ -745,6 +1671,10 @@ class RagService:
             "dedup_chunks_removed": dedup_removed,
             "diversity_caps_applied": diversity_caps_applied,
             "final_prompt_context_chars": total_chars,
+            "parameter_prompt_prioritization": parameter_intent,
+            "max_per_document_cap": max_per_document,
+            "max_per_api_ref_cap": max_per_api_ref,
+            "max_prompt_chunks_cap": max_prompt_chunks,
         }
 
     def _prompt_signature(self, item: dict[str, Any]) -> str:
@@ -768,9 +1698,36 @@ class RagService:
         }
         return {t for t in self._token_set(text) if t not in stopwords and len(t) >= 3}
 
-    def _is_context_insufficient(self, *, question: str, contexts: list[dict[str, Any]]) -> bool:
+    def _is_context_insufficient(
+        self,
+        *,
+        question: str,
+        contexts: list[dict[str, Any]],
+        detected_intents: list[str] | None = None,
+    ) -> bool:
         if not contexts:
             return True
+        intents_l = [str(i).strip().lower() for i in (detected_intents or [])]
+        if "parameter_intent" in intents_l:
+            for item in contexts:
+                ct = (item.get("chunk_type") or "").lower()
+                txt = str(item.get("chunk_text") or "")
+                if ct == "api_request_parameters_chunk" and txt.strip():
+                    return False
+        if "response_field_intent" in intents_l:
+            for item in contexts:
+                ct = (item.get("chunk_type") or "").lower()
+                txt = str(item.get("chunk_text") or "")
+                if ct == "generic_section_chunk" and generic_chunk_qualifies_as_response_fields(txt):
+                    return False
+                if ct == "api_response_parameters_chunk" and response_parameters_chunk_quality(txt).get("boost_ok"):
+                    return False
+                if ct == "api_sample_success_response_chunk" and _sample_success_tail_usable(txt):
+                    return False
+                if ct == "api_sample_failed_response_chunk" and _sample_failed_tail_usable(txt):
+                    return False
+                if ct == "endpoint_response_chunk" and txt.strip():
+                    return False
         question_terms = self._token_set_for_question(question)
         if not question_terms:
             return False
@@ -801,7 +1758,11 @@ class RagService:
             if "authentication_chunk" in chunk_types or any(t in joined for t in ["token", "oauth2", "client credentials", "getsso", "bearer"]):
                 return True
         if "error_intent" in intents:
-            if "api_sample_failed_response_chunk" in chunk_types or any(t in joined for t in ["returncode", "returnmsg", "incorrect", "invalid"]):
+            if (
+                "api_sample_failed_response_chunk" in chunk_types
+                or "api_error_codes_chunk" in chunk_types
+                or any(t in joined for t in ["returncode", "returnmsg", "incorrect", "invalid"])
+            ):
                 return True
             if "timeslotcategory" in joined:
                 return True
@@ -810,6 +1771,46 @@ class RagService:
                 return True
         if "overview_intent" in intents:
             if "document_overview_chunk" in chunk_types:
+                return True
+        if "response_field_intent" in intents:
+            if any(
+                (item.get("chunk_type") or "").lower() == "generic_section_chunk"
+                and generic_chunk_qualifies_as_response_fields(str(item.get("chunk_text") or ""))
+                for item in contexts
+            ):
+                return True
+            for item in contexts:
+                ct = (item.get("chunk_type") or "").lower()
+                txt = str(item.get("chunk_text") or "")
+                if ct == "api_response_parameters_chunk" and response_parameters_chunk_quality(txt).get("boost_ok"):
+                    return True
+                if ct == "endpoint_response_chunk" and txt.strip():
+                    return True
+                if ct == "api_sample_success_response_chunk" and _sample_success_tail_usable(txt):
+                    return True
+                if ct == "api_sample_failed_response_chunk" and _sample_failed_tail_usable(txt):
+                    return True
+            if any(
+                token in joined
+                for token in (
+                    "response parameters",
+                    "response parameter",
+                    "section: api response parameters",
+                )
+            ):
+                return True
+        if "parameter_intent" in intents:
+            if "api_request_parameters_chunk" in chunk_types:
+                return True
+            if any(
+                token in joined
+                for token in (
+                    "request parameters",
+                    "mandatory",
+                    "required",
+                    "api request parameters",
+                )
+            ):
                 return True
         return False
 
@@ -843,7 +1844,49 @@ class RagService:
             "document_version": item.get("document_version"),
             "knowledge_base_id": item.get("knowledge_base_id"),
             "knowledge_base_name": item.get("knowledge_base_name"),
+            "document_id": item.get("document_id"),
+            "upload_timestamp": item.get("upload_timestamp"),
+            "ingestion_run_id": item.get("ingestion_run_id"),
+            "is_active_document": item.get("is_active_document"),
         }
+
+    def _load_conversation_memory(self, session_id: int, knowledge_base_id: int) -> dict[str, Any]:
+        with SessionLocal() as db:
+            row = db.execute(
+                text(
+                    """
+                    SELECT summary_text, summary_message_count, summary_updated_at, knowledge_base_id
+                    FROM chat_sessions
+                    WHERE id = :session_id
+                    """
+                ),
+                {"session_id": session_id},
+            ).mappings().first()
+        if not row or row.get("knowledge_base_id") != knowledge_base_id:
+            return {"summary_text": None, "summary_message_count": 0, "summary_updated_at": None}
+        ts = row.get("summary_updated_at")
+        updated = ts.isoformat() if ts is not None and hasattr(ts, "isoformat") else None
+        return {
+            "summary_text": row.get("summary_text"),
+            "summary_message_count": int(row.get("summary_message_count") or 0),
+            "summary_updated_at": updated,
+        }
+
+    def _merge_conversation_summary_diagnostics(
+        self,
+        diagnostics: dict[str, Any],
+        conv_mem: dict[str, Any],
+        summary_used: bool,
+        debug: bool,
+    ) -> None:
+        if not debug:
+            return
+        diagnostics["conversation_summary_used"] = bool(summary_used)
+        diagnostics["conversation_summary_message_count"] = int(conv_mem.get("summary_message_count") or 0)
+        diagnostics["conversation_summary_updated_at"] = conv_mem.get("summary_updated_at")
+
+    async def _after_turn_persisted(self, session_id: int) -> None:
+        await conversation_summary_service.maybe_refresh_summary(session_id)
 
     def _ensure_session(
         self,
@@ -866,8 +1909,22 @@ class RagService:
             created = db.execute(
                 text(
                     """
-                    INSERT INTO chat_sessions (user_id, knowledge_base_id, title)
-                    VALUES (:user_id, :knowledge_base_id, :title)
+                    INSERT INTO chat_sessions (
+                        user_id,
+                        knowledge_base_id,
+                        title,
+                        summary_message_count,
+                        summary_text,
+                        summary_updated_at
+                    )
+                    VALUES (
+                        :user_id,
+                        :knowledge_base_id,
+                        :title,
+                        0,
+                        NULL,
+                        NULL
+                    )
                     RETURNING id
                     """
                 ),
@@ -880,13 +1937,7 @@ class RagService:
             db.commit()
             return int(created[0])
 
-    def _persist_messages(
-        self,
-        session_id: int,
-        question: str,
-        answer: str,
-        sources: list[dict[str, Any]],
-    ) -> None:
+    def _persist_user_message(self, session_id: int, question: str) -> None:
         with SessionLocal() as db:
             db.execute(
                 text(
@@ -902,6 +1953,10 @@ class RagService:
                     "sources_json": None,
                 },
             )
+            db.commit()
+
+    def _persist_assistant_message(self, session_id: int, answer: str, sources: list[dict[str, Any]]) -> None:
+        with SessionLocal() as db:
             db.execute(
                 text(
                     """
@@ -917,6 +1972,16 @@ class RagService:
                 },
             )
             db.commit()
+
+    def _persist_messages(
+        self,
+        session_id: int,
+        question: str,
+        answer: str,
+        sources: list[dict[str, Any]],
+    ) -> None:
+        self._persist_user_message(session_id, question)
+        self._persist_assistant_message(session_id, answer, sources)
 
     def _to_json_string(self, value: Any) -> str:
         import json

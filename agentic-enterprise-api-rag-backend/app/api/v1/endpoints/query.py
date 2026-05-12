@@ -1,10 +1,15 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Any
 
+from app.agents.orchestrator import agent_orchestrator
 from app.api.deps import check_knowledge_base_access, require_permission
+from app.core.config import settings
 from app.db.database import get_db
 from app.services.rag_service import rag_service
 
@@ -55,6 +60,16 @@ async def ask_question(
             access_level="read",
         ):
             raise HTTPException(status_code=403, detail="Knowledge base access denied")
+        if getattr(settings, "ENABLE_AGENT_ORCHESTRATION", False):
+            return await agent_orchestrator.run_query_ask(
+                project_id=payload.project_id,
+                knowledge_base_id=payload.knowledge_base_id,
+                question=payload.question,
+                top_k=payload.top_k,
+                session_id=payload.session_id,
+                user_id=current_user["id"],
+                debug=payload.debug,
+            )
         return await rag_service.answer_question(
             project_id=payload.project_id,
             knowledge_base_id=payload.knowledge_base_id,
@@ -70,6 +85,69 @@ async def ask_question(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"RAG answer failed: {exc}") from exc
+
+
+def _format_sse(event_name: str, data: dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/ask-stream")
+async def ask_question_stream(
+    payload: AskRequest,
+    current_user: dict = Depends(require_permission("query.ask")),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Same behavior as POST /query/ask but streams Server-Sent Events (SSE).
+    Event types: start, token, sources, diagnostics, done, error.
+    """
+    try:
+        kb = db.execute(
+            text("SELECT id, is_active FROM knowledge_bases WHERE id = :kb_id"),
+            {"kb_id": payload.knowledge_base_id},
+        ).mappings().first()
+        if kb is None or not kb["is_active"]:
+            raise HTTPException(status_code=404, detail="Knowledge base not found or inactive")
+        if not check_knowledge_base_access(
+            db=db,
+            user_id=current_user["id"],
+            knowledge_base_id=payload.knowledge_base_id,
+            access_level="read",
+        ):
+            raise HTTPException(status_code=403, detail="Knowledge base access denied")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def event_generator():
+        try:
+            async for item in rag_service.answer_question_stream(
+                project_id=payload.project_id,
+                knowledge_base_id=payload.knowledge_base_id,
+                question=payload.question,
+                top_k=payload.top_k,
+                session_id=payload.session_id,
+                user_id=current_user["id"],
+                debug=payload.debug,
+            ):
+                ev = str(item.get("event") or "message")
+                data = item.get("data")
+                if not isinstance(data, dict):
+                    data = {}
+                yield _format_sse(ev, data)
+        except Exception as exc:
+            yield _format_sse("error", {"detail": str(exc)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/sessions")
@@ -135,7 +213,7 @@ def get_session_messages(
     rows = db.execute(
         text(
             """
-            SELECT role, content, sources_json, created_at
+            SELECT id, role, content, sources_json, created_at
             FROM chat_messages
             WHERE session_id = :session_id
             ORDER BY id ASC
@@ -150,6 +228,7 @@ def get_session_messages(
         "knowledge_base_name": session_exists["knowledge_base_name"],
         "messages": [
             {
+                "id": row["id"],
                 "role": row["role"],
                 "content": row["content"],
                 "sources_json": row["sources_json"],

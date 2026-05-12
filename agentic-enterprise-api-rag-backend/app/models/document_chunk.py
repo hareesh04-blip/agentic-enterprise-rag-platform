@@ -11,6 +11,7 @@ class DocumentChunk(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("api_documents.id"), nullable=False, index=True)
+    ingestion_run_id: Mapped[int | None] = mapped_column(ForeignKey("ingestion_runs.id"), nullable=True, index=True)
     endpoint_id: Mapped[int | None] = mapped_column(ForeignKey("api_endpoints.id"), nullable=True, index=True)
     chunk_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)

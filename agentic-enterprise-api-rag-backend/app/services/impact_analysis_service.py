@@ -44,9 +44,21 @@ class ImpactAnalysisService:
     # Chunk types (must match ingestion/chunking_service.py exactly)
     AUTH_CHUNK_TYPE = "authentication_chunk"
     OVERVIEW_CHUNK_TYPES = {"api_overview_chunk", "api_metadata_chunk"}
-    REQUEST_CHUNK_TYPES = {"api_request_parameters_chunk"}
-    RESPONSE_CHUNK_TYPES = {"api_response_parameters_chunk"}
-    ERROR_CHUNK_TYPES = {"api_sample_failed_response_chunk", "api_sample_failed_request_chunk"}
+    REQUEST_CHUNK_TYPES = {
+        "api_request_parameters_chunk",
+        "api_header_parameters_chunk",
+        "api_query_parameters_chunk",
+    }
+    RESPONSE_CHUNK_TYPES = {
+        "api_response_parameters_chunk",
+        "api_sample_success_response_chunk",
+        "endpoint_response_chunk",
+    }
+    ERROR_CHUNK_TYPES = {
+        "api_sample_failed_response_chunk",
+        "api_sample_failed_request_chunk",
+        "api_error_codes_chunk",
+    }
     PRODUCT_CHUNK_TYPE = "product_section_chunk"
 
     def analyze_impact(

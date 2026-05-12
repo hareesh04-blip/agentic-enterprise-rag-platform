@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -135,6 +137,30 @@ class OllamaClient:
         }
         generate_url = f"{self.base_url}/api/generate"
         return await self._post(generate_url, payload)
+
+    async def generate_stream(self, prompt: str) -> AsyncIterator[str]:
+        """Stream decoded tokens from Ollama /api/generate with stream=true (NDJSON lines)."""
+        payload = {
+            "model": settings.OLLAMA_LLM_MODEL,
+            "prompt": prompt,
+            "stream": True,
+        }
+        generate_url = f"{self.base_url}/api/generate"
+        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+            async with client.stream("POST", generate_url, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        obj: dict[str, Any] = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    piece = obj.get("response") or ""
+                    if isinstance(piece, str) and piece:
+                        yield piece
+                    if obj.get("done") is True:
+                        break
 
     async def embedding_test(self, text: str) -> dict[str, Any]:
         payload = {

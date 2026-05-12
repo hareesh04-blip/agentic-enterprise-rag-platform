@@ -58,7 +58,16 @@ class SuggestedQuestionService:
             )
 
             if has_api_indicator or dominant_doc_type == "api":
-                suggestions.extend(self._api_questions(chunk_types, intents, service_names, api_refs, service_patterns))
+                suggestions.extend(
+                    self._api_questions(
+                        chunk_types,
+                        intents,
+                        service_names,
+                        api_refs,
+                        service_patterns,
+                        contexts=contexts or [],
+                    )
+                )
             elif has_hr_indicator or dominant_doc_type == "hr":
                 suggestions.extend(self._hr_questions(chunk_types, section_titles))
             elif has_product_indicator or dominant_doc_type == "product":
@@ -71,6 +80,43 @@ class SuggestedQuestionService:
         except Exception:
             return []
 
+    def _primary_api_scope(self, contexts: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+        """Prefer metadata/response chunks so suggested questions match the current retrieval, not arbitrary order."""
+        priority = (
+            "api_response_parameters_chunk",
+            "api_sample_success_response_chunk",
+            "api_metadata_chunk",
+            "api_overview_chunk",
+            "api_request_parameters_chunk",
+            "api_header_parameters_chunk",
+            "api_query_parameters_chunk",
+            "api_error_codes_chunk",
+            "api_jwt_payload_chunk",
+        )
+        rank = {t: i for i, t in enumerate(priority)}
+        best: tuple[int, int, str | None, str | None] | None = None
+        for idx, item in enumerate(contexts or []):
+            ct = (item.get("chunk_type") or "").strip().lower()
+            if ct not in rank:
+                continue
+            s_raw, r_raw = item.get("service_name"), item.get("api_reference_id")
+            s = str(s_raw).strip() if s_raw else None
+            r = str(r_raw).strip() if r_raw else None
+            if not s and not r:
+                continue
+            cand = (rank[ct], idx, s, r)
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+        if best:
+            return best[2], best[3]
+        for item in contexts or []:
+            s_raw, r_raw = item.get("service_name"), item.get("api_reference_id")
+            s = str(s_raw).strip() if s_raw else None
+            r = str(r_raw).strip() if r_raw else None
+            if s or r:
+                return s, r
+        return None, None
+
     def _api_questions(
         self,
         chunk_types: set[str],
@@ -78,10 +124,14 @@ class SuggestedQuestionService:
         service_names: list[str],
         api_refs: list[str],
         service_patterns: list[str],
+        contexts: list[dict[str, Any]] | None = None,
     ) -> list[str]:
         out: list[str] = []
-        primary_service = service_names[0] if service_names else None
-        primary_ref = api_refs[0] if api_refs else None
+        primary_service, primary_ref = self._primary_api_scope(contexts or [])
+        if not primary_service and service_names:
+            primary_service = service_names[0]
+        if not primary_ref and api_refs:
+            primary_ref = api_refs[0]
 
         if "authentication_intent" in intents:
             out.extend(
@@ -93,11 +143,24 @@ class SuggestedQuestionService:
                 ]
             )
 
-        if "api_request_parameters_chunk" in chunk_types or "parameter_intent" in intents:
+        if (
+            "api_request_parameters_chunk" in chunk_types
+            or "api_header_parameters_chunk" in chunk_types
+            or "api_query_parameters_chunk" in chunk_types
+            or "parameter_intent" in intents
+        ):
             out.append(self._api_scoped("What are the request parameters for this API?", primary_service, primary_ref))
-        if "api_response_parameters_chunk" in chunk_types or "api_sample_success_response_chunk" in chunk_types:
+        if (
+            "api_response_parameters_chunk" in chunk_types
+            or "api_sample_success_response_chunk" in chunk_types
+            or "response_field_intent" in intents
+        ):
             out.append(self._api_scoped("What are the success response fields for this API?", primary_service, primary_ref))
-        if "api_sample_failed_response_chunk" in chunk_types or "error_intent" in intents:
+        if (
+            "api_sample_failed_response_chunk" in chunk_types
+            or "api_error_codes_chunk" in chunk_types
+            or "error_intent" in intents
+        ):
             out.append(self._api_scoped("What are the failure response fields or error codes for this API?", primary_service, primary_ref))
             out.append(self._api_scoped("What error scenarios are documented for this API?", primary_service, primary_ref))
         if "authentication_chunk" in chunk_types or "authentication_intent" in intents:
@@ -229,7 +292,7 @@ class SuggestedQuestionService:
             return True
         if api_refs or service_names or service_methods or service_groups:
             return True
-        if {"authentication_intent", "error_intent", "api_lookup_intent", "parameter_intent", "async_intent"}.intersection(intents):
+        if {"authentication_intent", "error_intent", "api_lookup_intent", "parameter_intent", "async_intent", "response_field_intent"}.intersection(intents):
             return True
 
         q = (user_question or "").lower()

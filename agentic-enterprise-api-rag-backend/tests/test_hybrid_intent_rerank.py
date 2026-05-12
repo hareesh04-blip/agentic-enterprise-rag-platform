@@ -69,6 +69,35 @@ def test_reranking_prefers_failed_response_chunk() -> None:
     assert ranked[0]["chunk_type"] == "api_sample_failed_response_chunk"
 
 
+def test_promote_moves_matching_request_parameter_chunk_first() -> None:
+    svc = RetrievalService()
+    candidates = [
+        {
+            "chunk_type": "api_metadata_chunk",
+            "chunk_text": "metadata only",
+            "vector_score_raw": 0.9,
+            "fallback_score_raw": 0.0,
+            "score": 0.9,
+        },
+        {
+            "chunk_type": "api_request_parameters_chunk",
+            "chunk_text": "Request Parameters: Name customerId Mandatory Yes",
+            "service_name": "getAppointment",
+            "api_reference_id": "API-REST-DSE-01",
+            "vector_score_raw": 0.12,
+            "fallback_score_raw": 0.2,
+            "score": 0.12,
+        },
+    ]
+    out = svc._promote_matching_request_parameter_chunks(
+        candidates,
+        "What are the mandatory inputs for getAppointment?",
+        ["parameter_intent"],
+    )
+    assert out[0]["chunk_type"] == "api_request_parameters_chunk"
+    assert svc._last_parameter_promotion_applied is True
+
+
 def test_reranking_prefers_async_metadata_chunks() -> None:
     service = RetrievalService()
     candidates = [

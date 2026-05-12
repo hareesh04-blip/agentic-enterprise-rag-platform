@@ -26,6 +26,10 @@ class ConfidenceService:
             if not getattr(settings, "ENABLE_CONFIDENCE_SCORING", True):
                 return {"score": 0.0, "label": "low", "reasons": ["confidence scoring disabled"]}
 
+            ls = str(llm_status or "").strip().lower()
+            if ls == "fallback_provider_generation_failure":
+                return {"score": 0.0, "label": "low", "reasons": ["provider generation failure"]}
+
             if self._is_fallback(answer=answer, llm_status=llm_status):
                 return {"score": 0.0, "label": "low", "reasons": ["insufficient-context fallback"]}
 
@@ -193,7 +197,19 @@ class ConfidenceService:
                 aligned = True
             if "error_intent" in intents and ("failed" in chunk_type or "error" in chunk_type or "returncode" in text):
                 aligned = True
-            if "parameter_intent" in intents and ("parameter" in chunk_type or "parameter" in text):
+            if "parameter_intent" in intents and (
+                "parameter" in chunk_type
+                or "parameter" in text
+                or chunk_type in ("api_semantic_summary_chunk", "api_table_flattened_chunk")
+            ):
+                aligned = True
+            if "response_field_intent" in intents and (
+                chunk_type == "api_response_parameters_chunk"
+                or chunk_type == "api_sample_success_response_chunk"
+                or chunk_type == "endpoint_response_chunk"
+                or chunk_type == "api_semantic_summary_chunk"
+                or chunk_type == "generic_section_chunk"
+            ):
                 aligned = True
             if "async_intent" in intents and ("asynch" in text or "callback" in text):
                 aligned = True

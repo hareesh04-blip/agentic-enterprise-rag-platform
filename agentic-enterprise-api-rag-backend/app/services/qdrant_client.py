@@ -5,7 +5,7 @@ import uuid
 from typing import Any
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, PointStruct, VectorParams
+from qdrant_client.http.models import Distance, PointIdsList, PointStruct, VectorParams
 
 from app.core.config import settings
 from app.services.vector_dimension_resolver import get_active_vector_size
@@ -96,13 +96,27 @@ class QdrantService:
         # For provider-specific logic, always ensure collection exists with correct dim.
         self._ensure_collection_with_correct_dim()
 
-    def upsert_chunks(self, chunks_with_embeddings: list[dict[str, Any]]) -> list[str]:
+    def upsert_chunks(self, chunks_with_embeddings: list[dict[str, Any]]) -> list[str | None]:
+        """
+        Upsert vectors for chunks that have a non-empty embedding list.
+
+        Returns a list aligned with the input: UUID string for upserted points, None where skipped.
+        """
         self.create_collection_if_not_exists()
         collection_name = self._active_collection_name()
         points: list[PointStruct] = []
-        point_ids: list[str] = []
+        aligned_ids: list[str | None] = []
 
         for chunk in chunks_with_embeddings:
+            embedding = chunk.get("embedding")
+            if embedding is None or not isinstance(embedding, list) or len(embedding) == 0:
+                aligned_ids.append(None)
+                logger.warning(
+                    "qdrant_skip_chunk_no_embedding chunk_type=%s",
+                    chunk.get("chunk_type"),
+                )
+                continue
+
             point_id = str(uuid.uuid4())
             metadata = chunk.get("metadata") or {}
             payload = {
@@ -113,15 +127,27 @@ class QdrantService:
             points.append(
                 PointStruct(
                     id=point_id,
-                    vector=chunk.get("embedding", []),
+                    vector=embedding,
                     payload=payload,
                 )
             )
-            point_ids.append(point_id)
+            aligned_ids.append(point_id)
 
         if points:
             self.client.upsert(collection_name=collection_name, points=points)
-        return point_ids
+        return aligned_ids
+
+    def delete_points(self, point_ids: list[str]) -> None:
+        """Remove vectors by point id (does not delete DB chunk rows)."""
+        if not point_ids:
+            return
+        collection_name = self._active_collection_name()
+        if not self.collection_exists():
+            return
+        self.client.delete(
+            collection_name=collection_name,
+            points_selector=PointIdsList(points=point_ids),
+        )
 
     def collection_point_count(self) -> int:
         collection_name = self._active_collection_name()
@@ -156,8 +182,9 @@ class QdrantService:
         expected = self._expected_vector_size()
         return configured == expected
 
-    def verify_sample_points_retrievable(self, point_ids: list[str], sample: int = 5) -> dict[str, Any]:
+    def verify_sample_points_retrievable(self, point_ids: list[str | None], sample: int = 5) -> dict[str, Any]:
         """Lightweight post-upsert check: retrieve a small sample of point IDs."""
+        point_ids = [pid for pid in point_ids if pid]
         if not point_ids:
             return {"sample_size": 0, "retrieved_count": 0, "sample_verified": True}
         if not self.collection_exists():

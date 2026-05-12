@@ -113,6 +113,34 @@ def require_knowledge_base_access(access_level: str = "read"):
     return dependency
 
 
+def require_admin_or_super_admin(
+    current_user: dict[str, Any] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Restrict routes to users with role `super_admin` or `admin` only.
+    """
+    allowed = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM user_roles ur
+            JOIN roles r ON r.id = ur.role_id
+            WHERE ur.user_id = :user_id
+              AND r.name IN ('super_admin', 'admin')
+            LIMIT 1
+            """
+        ),
+        {"user_id": current_user["id"]},
+    ).scalar()
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or super admin role required",
+        )
+    return current_user
+
+
 def check_knowledge_base_access(db: Session, user_id: int, knowledge_base_id: int, access_level: str = "read") -> bool:
     has_access = db.execute(
         text(

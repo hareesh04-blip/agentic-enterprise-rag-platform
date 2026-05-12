@@ -17,6 +17,21 @@ from app.services.qdrant_client import qdrant_service
 logger = logging.getLogger(__name__)
 
 
+def _embedding_provider_label() -> str:
+    return (settings.EMBEDDING_PROVIDER or "ollama").strip().lower()
+
+
+def _resolve_document_version(prev_version: str | None, explicit: str | None) -> str:
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()[:100]
+    if not prev_version:
+        return "1"
+    try:
+        return str(int(str(prev_version).strip()) + 1)
+    except ValueError:
+        return str(prev_version)[:100]
+
+
 class IngestionService:
     async def ingest_docx(
         self,
@@ -30,6 +45,7 @@ class IngestionService:
         version: str | None = None,
         file_name: str,
         file_bytes: bytes,
+        uploaded_by_user_id: int | None = None,
     ) -> dict[str, Any]:
         project_row = db.execute(
             text("SELECT id FROM api_projects WHERE id = :project_id"),
@@ -37,6 +53,8 @@ class IngestionService:
         ).fetchone()
         if project_row is None:
             raise ValueError(f"Project {project_id} does not exist")
+
+        ingestion_run_id: int | None = None
 
         try:
             parsed = docx_parser_service.parse_preview(file_name, file_bytes)
@@ -76,6 +94,52 @@ class IngestionService:
                 knowledge_base_id,
             )
         now = datetime.now(timezone.utc)
+        embed_prov = _embedding_provider_label()
+        vector_collection_name = qdrant_service._active_collection_name()
+
+        run_row = db.execute(
+            text(
+                """
+                INSERT INTO ingestion_runs (
+                    knowledge_base_id, uploaded_by, status, embedding_provider, vector_collection,
+                    document_count, chunk_count, vector_count, started_at
+                )
+                VALUES (
+                    :knowledge_base_id, :uploaded_by, :status, :embedding_provider, :vector_collection,
+                    0, 0, 0, :started_at
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "knowledge_base_id": knowledge_base_id,
+                "uploaded_by": uploaded_by_user_id,
+                "status": "running",
+                "embedding_provider": embed_prov,
+                "vector_collection": vector_collection_name,
+                "started_at": now,
+            },
+        ).fetchone()
+        ingestion_run_id = int(run_row[0]) if run_row else None
+
+        prev_doc = db.execute(
+            text(
+                """
+                SELECT id, document_version
+                FROM api_documents
+                WHERE knowledge_base_id = :kb_id
+                  AND file_name = :file_name
+                  AND is_active_document IS TRUE
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"kb_id": knowledge_base_id, "file_name": file_name},
+        ).fetchone()
+        prev_document_id = int(prev_doc[0]) if prev_doc else None
+        prev_version = str(prev_doc[1]) if prev_doc and prev_doc[1] is not None else None
+        resolved_version = _resolve_document_version(prev_version, version)
+
         job_row = db.execute(
             text(
                 """
@@ -100,11 +164,15 @@ class IngestionService:
                     """
                     INSERT INTO api_documents (
                         project_id, knowledge_base_id, file_name, source_type, document_type, source_domain, product_name,
-                        document_title, document_version, raw_file_path
+                        document_title, document_version, raw_file_path,
+                        ingestion_run_id, uploaded_by, uploaded_at, embedding_provider, vector_collection_name,
+                        ingestion_status, is_active_document
                     )
                     VALUES (
                         :project_id, :knowledge_base_id, :file_name, :source_type, :document_type, :source_domain, :product_name,
-                        :document_title, :document_version, :raw_file_path
+                        :document_title, :document_version, :raw_file_path,
+                        :ingestion_run_id, :uploaded_by, :uploaded_at, :embedding_provider, :vector_collection_name,
+                        :ingestion_status, TRUE
                     )
                     RETURNING id
                     """
@@ -118,11 +186,30 @@ class IngestionService:
                     "source_domain": source_domain,
                     "product_name": product_name,
                     "document_title": (parsed.get("document_title") or file_name)[:255],
-                    "document_version": version,
+                    "document_version": resolved_version,
                     "raw_file_path": f"uploaded://{file_name}",
+                    "ingestion_run_id": ingestion_run_id,
+                    "uploaded_by": uploaded_by_user_id,
+                    "uploaded_at": now,
+                    "embedding_provider": embed_prov,
+                    "vector_collection_name": vector_collection_name,
+                    "ingestion_status": "processing",
                 },
             ).fetchone()
             document_id = document_row[0]
+
+            if prev_document_id is not None:
+                db.execute(
+                    text(
+                        """
+                        UPDATE api_documents
+                        SET is_active_document = FALSE,
+                            superseded_by_document_id = :new_id
+                        WHERE id = :old_id
+                        """
+                    ),
+                    {"new_id": document_id, "old_id": prev_document_id},
+                )
             logger.info(
                 "ingestion_chunking_persist_summary document_id=%s knowledge_base_id=%s total_chunks=%s "
                 "chunk_type_counts=%s detected_api_count=%s detected_api_reference_ids=%s first_5_chunks=%s",
@@ -179,7 +266,10 @@ class IngestionService:
 
                 self._persist_parameters(db, endpoint_id, "header", api.get("header_parameters", []))
                 self._persist_parameters(db, endpoint_id, "input", api.get("input_parameters", []))
+                self._persist_parameters(db, endpoint_id, "query", api.get("query_parameters", []))
                 self._persist_parameters(db, endpoint_id, "output_success", api.get("output_response_success", []))
+                self._persist_parameters(db, endpoint_id, "error", api.get("error_code_parameters", []))
+                self._persist_parameters(db, endpoint_id, "jwt_payload", api.get("jwt_payload_parameters", []))
                 self._persist_samples(db, endpoint_id, api)
 
             db_chunk_ids: list[int] = []
@@ -190,13 +280,18 @@ class IngestionService:
                 chunk_row = db.execute(
                     text(
                         """
-                        INSERT INTO document_chunks (document_id, endpoint_id, chunk_type, chunk_text, qdrant_point_id)
-                        VALUES (:document_id, :endpoint_id, :chunk_type, :chunk_text, :qdrant_point_id)
+                        INSERT INTO document_chunks (
+                            document_id, ingestion_run_id, endpoint_id, chunk_type, chunk_text, qdrant_point_id
+                        )
+                        VALUES (
+                            :document_id, :ingestion_run_id, :endpoint_id, :chunk_type, :chunk_text, :qdrant_point_id
+                        )
                         RETURNING id
                         """
                     ),
                     {
                         "document_id": document_id,
+                        "ingestion_run_id": ingestion_run_id,
                         "endpoint_id": endpoint_id,
                         "chunk_type": (chunk.get("chunk_type") or "unknown")[:100],
                         "chunk_text": chunk.get("chunk_text") or "",
@@ -208,7 +303,6 @@ class IngestionService:
             qdrant_points_created = 0
             embedding_error: str | None = None
             vector_store_status = "skipped_no_embedding"
-            vector_collection_name = qdrant_service._active_collection_name()
             vector_embedding_dimension: int | None = None
             vector_db_chunk_count_expected = len(db_chunk_ids)
             vector_point_count_delta_ok: bool | None = None
@@ -218,33 +312,59 @@ class IngestionService:
 
             try:
                 embedded_chunks = await embedding_service.embed_chunks(chunks)
-                if embedded_chunks:
-                    vec0 = embedded_chunks[0].get("embedding")
-                    if isinstance(vec0, list):
-                        vector_embedding_dimension = len(vec0)
-                qdrant_point_ids = qdrant_service.upsert_chunks(embedded_chunks)
-                vector_point_count_delta_ok = len(qdrant_point_ids) == len(db_chunk_ids) == len(
-                    embedded_chunks,
+                chunks_without_embedding = sum(
+                    1
+                    for c in embedded_chunks
+                    if (not isinstance(c.get("embedding"), list)) or (not c.get("embedding"))
                 )
+                chunks_with_embedding = len(embedded_chunks) - chunks_without_embedding
 
-                if not vector_point_count_delta_ok:
+                if embedded_chunks:
+                    for ec in embedded_chunks:
+                        emb = ec.get("embedding")
+                        if isinstance(emb, list) and emb:
+                            vector_embedding_dimension = len(emb)
+                            break
+
+                qdrant_point_ids = qdrant_service.upsert_chunks(embedded_chunks)
+                qdrant_points_created = sum(1 for pid in qdrant_point_ids if pid)
+
+                vector_point_count_delta_ok = chunks_with_embedding == qdrant_points_created
+
+                if chunks_without_embedding and qdrant_points_created > 0:
+                    vector_store_status = "partial_persisted_with_warnings"
+                    embedding_error = (
+                        f"{chunks_without_embedding} chunk(s) skipped embedding or upsert (see logs)"
+                    )
+                elif chunks_without_embedding and qdrant_points_created == 0:
+                    vector_store_status = "embedding_failed"
+                    embedding_error = "All chunks failed embedding or produced no vectors"
+                elif not vector_point_count_delta_ok:
                     vector_store_status = "persisted_partial_count_mismatch"
+                    embedding_error = (
+                        f"embedding vs points mismatch: embedded_ok={chunks_with_embedding} "
+                        f"points={qdrant_points_created}"
+                    )
                     logger.warning(
-                        "ingestion_vector_count_mismatch document_id=%s chunks=%s embedded=%s points=%s",
+                        "ingestion_vector_count_mismatch document_id=%s chunks=%s embedded_ok=%s points=%s",
                         document_id,
                         len(db_chunk_ids),
-                        len(embedded_chunks),
-                        len(qdrant_point_ids),
+                        chunks_with_embedding,
+                        qdrant_points_created,
                     )
                 else:
                     vector_store_status = "persisted_ok"
+
+                if qdrant_points_created > 0:
                     sample_diag = qdrant_service.verify_sample_points_retrievable(qdrant_point_ids)
                     vector_sample_verified = bool(sample_diag.get("sample_verified"))
-                    if not vector_sample_verified and qdrant_point_ids:
-                        vector_store_status = "persisted_sample_verify_failed"
+                    if not vector_sample_verified:
+                        if vector_store_status == "persisted_ok":
+                            vector_store_status = "persisted_sample_verify_failed"
                         logger.warning(
-                            "ingestion_vector_sample_verify_failed document_id=%s sample_diag=%s",
+                            "ingestion_vector_sample_verify_failed document_id=%s status=%s sample_diag=%s",
                             document_id,
+                            vector_store_status,
                             sample_diag,
                         )
 
@@ -253,24 +373,26 @@ class IngestionService:
 
                 logger.info(
                     "ingestion_vector_persist document_id=%s kb_id=%s status=%s collection=%s "
-                    "point_count=%s chunk_expected=%s embed_dim=%s collection_dim=%s dim_match_settings=%s sample_ok=%s",
+                    "point_count=%s chunk_expected=%s chunks_embed_failed=%s embed_dim=%s collection_dim=%s "
+                    "dim_match_settings=%s sample_ok=%s",
                     document_id,
                     knowledge_base_id,
                     vector_store_status,
                     vector_collection_name,
-                    len(qdrant_point_ids),
+                    qdrant_points_created,
                     vector_db_chunk_count_expected,
+                    chunks_without_embedding,
                     vector_embedding_dimension,
                     collection_embedding_dim,
                     embedding_dim_matches_collection,
                     vector_sample_verified,
                 )
-                for chunk_id, point_id in zip(db_chunk_ids, qdrant_point_ids, strict=False):
-                    db.execute(
-                        text("UPDATE document_chunks SET qdrant_point_id = :point_id WHERE id = :chunk_id"),
-                        {"point_id": point_id, "chunk_id": chunk_id},
-                    )
-                qdrant_points_created = len(qdrant_point_ids)
+                for chunk_id, point_id in zip(db_chunk_ids, qdrant_point_ids, strict=True):
+                    if point_id:
+                        db.execute(
+                            text("UPDATE document_chunks SET qdrant_point_id = :point_id WHERE id = :chunk_id"),
+                            {"point_id": point_id, "chunk_id": chunk_id},
+                        )
             except Exception as exc:
                 embedding_error = str(exc)
                 vector_store_status = "embedding_failed"
@@ -300,23 +422,70 @@ class IngestionService:
                     "job_id": ingestion_job_id,
                 },
             )
+
+            doc_status = "completed"
+            if vector_store_status == "embedding_failed":
+                doc_status = "embedding_failed"
+            elif vector_store_status not in ("persisted_ok", "skipped_no_embedding"):
+                doc_status = "completed_with_warnings"
+
+            db.execute(
+                text(
+                    """
+                    UPDATE api_documents
+                    SET ingestion_status = :ingestion_status
+                    WHERE id = :document_id
+                    """
+                ),
+                {"ingestion_status": doc_status, "document_id": document_id},
+            )
+
+            completed_ts = datetime.now(timezone.utc)
+            run_status = "completed" if not embedding_error else "completed_with_warnings"
+            if ingestion_run_id is not None:
+                db.execute(
+                    text(
+                        """
+                        UPDATE ingestion_runs
+                        SET completed_at = :completed_at,
+                            status = :status,
+                            document_count = 1,
+                            chunk_count = :chunk_count,
+                            vector_count = :vector_count
+                        WHERE id = :run_id
+                        """
+                    ),
+                    {
+                        "completed_at": completed_ts,
+                        "status": run_status,
+                        "chunk_count": len(db_chunk_ids),
+                        "vector_count": qdrant_points_created,
+                        "run_id": ingestion_run_id,
+                    },
+                )
+
             db.commit()
 
             return {
                 "ingestion_job_id": ingestion_job_id,
+                "ingestion_run_id": ingestion_run_id,
                 "project_id": project_id,
                 "document_id": document_id,
                 "document_type": document_type,
                 "source_domain": source_domain,
                 "product_name": product_name,
-                "version": version,
+                "version": resolved_version,
                 "api_count": len(apis),
                 "chunk_count": len(db_chunk_ids),
                 "qdrant_points_created": qdrant_points_created,
                 "embedding_status": (
                     "embedding_retry_failed"
                     if embedding_error and "retry_failed" in embedding_error.lower()
-                    else ("embedding_skipped" if embedding_error else "stored")
+                    else (
+                        "partial_embedding_failed"
+                        if embedding_error and qdrant_points_created > 0
+                        else ("embedding_skipped" if embedding_error else "stored")
+                    )
                 ),
                 "embedding_error": embedding_error,
                 "vector_store_status": vector_store_status,
@@ -349,6 +518,22 @@ class IngestionService:
                     "job_id": ingestion_job_id,
                 },
             )
+            if ingestion_run_id is not None:
+                db.execute(
+                    text(
+                        """
+                        UPDATE ingestion_runs
+                        SET completed_at = :completed_at,
+                            status = :status
+                        WHERE id = :run_id
+                        """
+                    ),
+                    {
+                        "completed_at": datetime.now(timezone.utc),
+                        "status": "failed",
+                        "run_id": ingestion_run_id,
+                    },
+                )
             db.commit()
             raise
 

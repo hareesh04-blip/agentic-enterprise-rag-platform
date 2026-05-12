@@ -19,6 +19,7 @@ class KnowledgeBase(Base):
 
     user_access: Mapped[list["UserKnowledgeBaseAccess"]] = relationship(back_populates="knowledge_base")
     documents: Mapped[list["ApiDocument"]] = relationship(back_populates="knowledge_base")
+    ingestion_runs: Mapped[list["IngestionRun"]] = relationship(back_populates="knowledge_base")
 
 
 class UserKnowledgeBaseAccess(Base):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -63,6 +65,36 @@ class OpenAIClient:
         if not isinstance(content, str):
             raise RuntimeError("Invalid OpenAI chat response: missing message.content")
         return content.strip()
+
+    async def generate_stream(self, prompt: str, *, model: str | None = None) -> AsyncIterator[str]:
+        used_model = model or settings.OPENAI_LLM_MODEL
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": used_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "stream": True,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout, trust_env=True) as client:
+            async with client.stream("POST", url, headers=self._headers(), json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk: dict[str, Any] = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0] or {}).get("delta") or {}
+                    content = delta.get("content") or ""
+                    if isinstance(content, str) and content:
+                        yield content
 
 
 openai_client = OpenAIClient()
